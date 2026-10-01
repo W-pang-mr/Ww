@@ -1,0 +1,6 @@
+aiogram>=3.7,<4
+tonsdk
+httpx
+qrcode[pil]
+cryptography
+python-dotenv
