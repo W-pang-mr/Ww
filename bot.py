@@ -5,7 +5,9 @@ import html
 import io
 import logging
 import math
+import multiprocessing as mp
 import os
+import queue as pyqueue
 import re
 import sqlite3
 import time
@@ -674,21 +676,60 @@ def generate_wallets(n: int):
     return [first] + [make() for _ in range(n - 1)]
 
 
-# ───────────── جستجوی آدرس خاص (Vanity) ─────────────
-# محدودیت زمانی برداشته شد؛ جستجو فقط با تمام شدن تعداد تلاش یا دکمه‌ی توقف تمام می‌شود.
+# ───────────── جستجوی آدرس خاص (Vanity) — چندالگویی و چندپردازشی ─────────────
+# تا ۵ الگو هم‌زمان؛ هر آدرس ساخته‌شده با همه‌ی الگوها مقایسه می‌شود.
+# ساخت ولت (PBKDF2 سنگین) روی چند پردازش جدا موازی می‌شود تا از همه‌ی هسته‌ها استفاده شود.
 VN_TRIES = (1000, 5000, 20000, 100000)
+VN_MAX_PATTERNS = 5  # حداکثر تعداد الگو در یک جستجو
+VN_MAX_FOUND = 300  # سقف نتایج؛ با رسیدن به آن جستجو خودکار متوقف می‌شود
+VN_CHUNK = 4  # هر پردازش در هر نوبت این تعداد تلاش را برمی‌دارد
+VN_UPDATE_EVERY = 3.0  # فاصله‌ی به‌روزرسانی پیام وضعیت (ثانیه)
 VN_PROGRESS: dict = {}
+VN_STATS: dict = {}  # سرعت آخرین جستجو (برای تخمین زمان)
 SEARCH_LOCK = asyncio.Lock()
 
+MODE_FA = {
+    "prefix": "شروع آدرس (بعد از UQ)",
+    "suffix": "پایان آدرس",
+    "contains": "داخل آدرس",
+}
+MODE_SHORT = {"prefix": "شروع", "suffix": "پایان", "contains": "داخل"}
 
-def vanity_match(addr: str, mode: str, pat: str, cs: bool) -> bool:
+
+def _cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def _workers() -> int:
+    """تعداد پردازش‌ها: پیش‌فرض min(4, هسته‌ها)؛ با Environment به اسم VN_WORKERS قابل تغییر."""
+    try:
+        env = int(os.getenv("VN_WORKERS", "0") or 0)
+    except ValueError:
+        env = 0
+    n = env if env > 0 else min(4, _cpu_count())
+    return max(1, min(n, 16))
+
+
+VN_WORKERS = _workers()
+
+
+def vanity_hits(addr: str, specs: list, cs: bool) -> list:
+    """اندیس همه‌ی الگوهایی که با این آدرس جور هستند (لیست خالی = هیچ‌کدام)."""
     a = addr if cs else addr.lower()
-    q = pat if cs else pat.lower()
-    if mode == "prefix":
-        return a[2:].startswith(q)
-    if mode == "suffix":
-        return a.endswith(q)
-    return q in a[3:]
+    hits = []
+    for i, (mode, q) in enumerate(specs):
+        if mode == "prefix":
+            ok = a[2:].startswith(q)
+        elif mode == "suffix":
+            ok = a.endswith(q)
+        else:
+            ok = q in a[3:]
+        if ok:
+            hits.append(i)
+    return hits
 
 
 def vanity_probability(mode: str, pat: str, cs: bool) -> float:
@@ -708,19 +749,237 @@ def vanity_probability(mode: str, pat: str, cs: bool) -> float:
     return p
 
 
-def vanity_search(mode: str, pat: str, cs: bool, tries: int, progress: dict) -> None:
+def vanity_worker(specs, cs, tries, claimed, checked, nfound, stop, out_q, err_q) -> None:
+    """یک پردازش جدا: ولت می‌سازد و با همه‌ی الگوها مقایسه می‌کند."""
     try:
-        make, first = _get_creator()
-        for i in range(tries):
-            if progress["stop"]:
+        make, pending = _get_creator()
+        while not stop.is_set():
+            with claimed.get_lock():
+                take = min(VN_CHUNK, tries - claimed.value)
+                if take <= 0:
+                    break
+                claimed.value += take
+            for _ in range(take):
+                if stop.is_set():
+                    break
+                if pending is not None:
+                    item, pending = pending, None
+                else:
+                    item = make()
+                with checked.get_lock():
+                    checked.value += 1
+                hits = vanity_hits(item[0], specs, cs)
+                if hits:
+                    out_q.put((item[0], item[1], hits))
+                    with nfound.get_lock():
+                        nfound.value += 1
+                        if nfound.value >= VN_MAX_FOUND:
+                            stop.set()
+    except Exception as e:  # noqa: BLE001
+        err_q.put(repr(e)[:1500])
+
+
+def vn_start_workers(specs: list, cs: bool, tries: int) -> dict:
+    methods = mp.get_all_start_methods()
+    ctx = mp.get_context("forkserver" if "forkserver" in methods else "spawn")
+    st = {
+        "claimed": ctx.Value("q", 0),
+        "checked": ctx.Value("q", 0),
+        "nfound": ctx.Value("q", 0),
+        "stop": ctx.Event(),
+        "out_q": ctx.Queue(),
+        "err_q": ctx.Queue(),
+        "procs": [],
+    }
+    n = max(1, min(VN_WORKERS, math.ceil(tries / VN_CHUNK)))
+    try:
+        for _ in range(n):
+            p = ctx.Process(
+                target=vanity_worker,
+                args=(
+                    specs,
+                    cs,
+                    tries,
+                    st["claimed"],
+                    st["checked"],
+                    st["nfound"],
+                    st["stop"],
+                    st["out_q"],
+                    st["err_q"],
+                ),
+                daemon=True,
+            )
+            p.start()
+            st["procs"].append(p)
+    except Exception:
+        vn_stop_workers(st)
+        raise
+    return st
+
+
+def vn_stop_workers(st: dict) -> None:
+    st["stop"].set()
+    deadline = time.time() + 8
+    for p in st["procs"]:
+        p.join(max(0.1, deadline - time.time()))
+    for p in st["procs"]:
+        if p.is_alive():
+            p.terminate()
+    for p in st["procs"]:
+        p.join(2)
+    for q in (st["out_q"], st["err_q"]):
+        try:
+            q.close()
+            q.cancel_join_thread()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def vn_drain(q) -> list:
+    items = []
+    while True:
+        try:
+            items.append(q.get_nowait())
+        except (pyqueue.Empty, OSError, EOFError):
+            break
+    return items
+
+
+def fmt_dur(sec: float) -> str:
+    sec = int(max(0, sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def vn_label(mode: str, pat: str) -> str:
+    return f"{pat} ({MODE_SHORT[mode]})"
+
+
+def vn_bar(frac: float, n: int = 16) -> str:
+    f = max(0, min(n, int(frac * n)))
+    return "█" * f + "░" * (n - f)
+
+
+def vn_progress_text(
+    patterns: list,
+    tries: int,
+    checked: int,
+    elapsed: float,
+    workers: int,
+    counts: list,
+    last_addr: str,
+    stopping: bool,
+) -> str:
+    frac = min(1.0, checked / tries) if tries else 0.0
+    speed = checked / elapsed if elapsed > 0 else 0.0
+    head = "🛑 در حال توقف…" if stopping else "🔎 <b>جستجوی آدرس خاص</b>"
+    time_line = f"⏱ گذشته: {fmt_dur(elapsed)}"
+    if speed > 0 and checked > 0 and not stopping:
+        time_line += f" | باقی‌مانده (حداکثر): ~{fmt_dur((tries - checked) / speed)}"
+    lines = [
+        head,
+        "",
+        f"{vn_bar(frac)} {frac * 100:.1f}%",
+        f"📊 بررسی‌شده: {checked:,} / {tries:,}",
+        f"⚡ سرعت: {speed:.1f} آدرس در ثانیه ({workers} پردازش)",
+        time_line,
+        "",
+        f"🎯 پیدا شده: <b>{sum(counts)}</b>",
+    ]
+    for (mode, pat), n in zip(patterns, counts):
+        lines.append(f"{'✅' if n else '▫️'} <code>{html.escape(pat)}</code> ({MODE_SHORT[mode]}): {n}")
+    if last_addr:
+        lines += ["", "🆕 آخرین آدرس پیدا شده:", f"<code>{last_addr}</code>"]
+    return "\n".join(lines)
+
+
+async def vn_run(patterns: list, cs: bool, tries: int, progress: dict, status: Message, stop_kb) -> dict:
+    """جستجو را اجرا می‌کند و پیام وضعیت را زنده به‌روز نگه می‌دارد."""
+    specs = [(m, p if cs else p.lower()) for m, p in patterns]
+    counts = [0] * len(patterns)
+    found: list = []
+    labels: dict = {}
+    last_addr = ""
+    err = None
+    warn = None
+    checked = 0
+    capped = False
+    workers = 0
+    st = None
+    t0 = time.time()
+
+    def absorb(items: list) -> None:
+        nonlocal last_addr
+        for addr, words, hits in items:
+            found.append((addr, words))
+            labels[addr] = " | ".join(vn_label(*patterns[i]) for i in hits)
+            for i in hits:
+                counts[i] += 1
+            last_addr = addr
+
+    try:
+        st = await asyncio.to_thread(vn_start_workers, specs, cs, tries)
+        workers = len(st["procs"])
+        last_edit = 0.0
+        while True:
+            await asyncio.sleep(0.5)
+            absorb(vn_drain(st["out_q"]))
+            if progress["stop"] and not st["stop"].is_set():
+                st["stop"].set()
+            alive = any(p.is_alive() for p in st["procs"])
+            now = time.time()
+            if alive and now - last_edit >= VN_UPDATE_EVERY:
+                last_edit = now
+                text = vn_progress_text(
+                    patterns,
+                    tries,
+                    st["checked"].value,
+                    now - t0,
+                    workers,
+                    counts,
+                    last_addr,
+                    st["stop"].is_set(),
+                )
+                try:
+                    await status.edit_text(text, reply_markup=stop_kb)
+                except Exception:  # noqa: BLE001
+                    pass
+            if not alive:
                 break
-            item = first if i == 0 else make()
-            progress["done"] = i + 1
-            if vanity_match(item[0], mode, pat, cs):
-                progress["found"].append(item)
-    except Exception as e:
+        await asyncio.sleep(0.3)
+        absorb(vn_drain(st["out_q"]))
+        checked = st["checked"].value
+        capped = st["nfound"].value >= VN_MAX_FOUND
+        errs = list(dict.fromkeys(vn_drain(st["err_q"])))
+        crashed = [p.exitcode for p in st["procs"] if p.exitcode not in (0, None)]
+        if errs or crashed:
+            msg = " || ".join(errs) if errs else f"worker exit codes: {crashed}"
+            if checked == 0:
+                err = msg
+            else:
+                warn = msg
+    except Exception as e:  # noqa: BLE001
         logging.exception("vanity search failed")
-        progress["error"] = repr(e)
+        err = repr(e)
+    finally:
+        if st is not None:
+            await asyncio.to_thread(vn_stop_workers, st)
+    elapsed = time.time() - t0
+    if checked > 20 and elapsed > 0:
+        VN_STATS["speed"] = checked / elapsed
+    return {
+        "found": found,
+        "labels": labels,
+        "counts": counts,
+        "checked": checked,
+        "elapsed": elapsed,
+        "workers": workers,
+        "error": err,
+        "warn": warn,
+        "stopped": progress["stop"],
+        "capped": capped,
+    }
 
 
 async def delete_later(msg: Message, seconds: int) -> None:
@@ -731,13 +990,22 @@ async def delete_later(msg: Message, seconds: int) -> None:
         pass
 
 
-async def send_wallet_files(m: Message, wallets: list, caption: str) -> None:
+async def send_wallet_files(m: Message, wallets: list, caption: str, labels: dict | None = None) -> None:
+    labels = labels or {}
     txt = "\n".join(
-        f"#{i}\nAddress: {a}\nMnemonic: {w}\n" for i, (a, w) in enumerate(wallets, 1)
+        f"#{i}\nAddress: {a}\n"
+        + (f"Match: {labels[a]}\n" if a in labels else "")
+        + f"Mnemonic: {w}\n"
+        for i, (a, w) in enumerate(wallets, 1)
     )
-    csv = "index,address,mnemonic\n" + "\n".join(
-        f"{i},{a},{w}" for i, (a, w) in enumerate(wallets, 1)
-    )
+    if labels:
+        csv = "index,address,mnemonic,match\n" + "\n".join(
+            f"{i},{a},{w},{labels.get(a, '')}" for i, (a, w) in enumerate(wallets, 1)
+        )
+    else:
+        csv = "index,address,mnemonic\n" + "\n".join(
+            f"{i},{a},{w}" for i, (a, w) in enumerate(wallets, 1)
+        )
     stamp = time.strftime("%Y%m%d-%H%M%S")
     await m.answer_document(
         BufferedInputFile(txt.encode("utf-8"), filename=f"wallets-{stamp}.txt"),
@@ -958,42 +1226,92 @@ async def cb_wl_delallyes(c: CallbackQuery):
     await c.message.answer("✅ همه ولت‌ها حذف شدند.", reply_markup=wl_menu_kb())
 
 
-# ───────────── هندلرهای آدرس خاص ─────────────
-MODE_FA = {
-    "prefix": "شروع آدرس (بعد از UQ)",
-    "suffix": "پایان آدرس",
-    "contains": "داخل آدرس",
-}
+# ───────────── هندلرهای آدرس خاص (تا ۵ الگو) ─────────────
+async def safe_edit(msg: Message, text: str, kb) -> None:
+    try:
+        await msg.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            await msg.answer(text, reply_markup=kb)
+
+
+def vn_mode_kb(back: bool) -> InlineKeyboardMarkup:
+    last = [btn("❌ انصراف", "cancel")]
+    if back:
+        last.insert(0, btn("⬅️ برگشت", "vn_back"))
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("🔚 پایان آدرس", "vn_m:suffix"), btn("🔝 شروع آدرس", "vn_m:prefix")],
+            [btn("🔍 داخل آدرس", "vn_m:contains")],
+            last,
+        ]
+    )
+
+
+def vn_mode_text(patterns: list) -> str:
+    slots = VN_MAX_PATTERNS - len(patterns)
+    text = "🎯 <b>آدرس خاص</b>\nالگوی بعدی را کجای آدرس می‌خواهی؟\n\n"
+    if patterns:
+        text += "الگوهای انتخاب‌شده:\n"
+        text += "\n".join(
+            f"{i}. <code>{html.escape(p)}</code> — {MODE_FA[m]}"
+            for i, (m, p) in enumerate(patterns, 1)
+        )
+        text += "\n\n"
+    text += (
+        f"ظرفیت باقی‌مانده: {slots} از {VN_MAX_PATTERNS} الگو.\n"
+        "پیشنهاد: «پایان آدرس» بهترین و راحت‌ترین حالت است."
+    )
+    return text
 
 
 def vn_view(data: dict):
-    mode, pat = data["mode"], data["pattern"]
+    patterns = data["patterns"]
     tries, cs = data["tries"], data["cs"]
-    p = vanity_probability(mode, pat, cs)
+    probs = [vanity_probability(m, p, cs) for m, p in patterns]
+    p_any = 1 - math.prod(1 - min(1.0, x) for x in probs)
+    expected = tries * sum(probs)
+    if p_any >= 1:
+        any_p = 1.0
+    else:
+        any_p = -math.expm1(tries * math.log1p(-p_any))
+
+    plines = []
+    for i, ((mode, pat), p) in enumerate(zip(patterns, probs), 1):
+        odds = f"۱ از {1 / p:,.0f}" if p else "غیرممکن"
+        plines.append(f"{i}. <code>{html.escape(pat)}</code> — {MODE_FA[mode]} — {odds}")
+
     rows = [
-        [
-            btn(("✅ " if tries == t else "") + f"{t:,}", f"vn_t:{t}")
-            for t in VN_TRIES
-        ],
+        [btn(("✅ " if tries == t else "") + f"{t:,}", f"vn_t:{t}") for t in VN_TRIES],
         [btn(f"🔠 حساس به حروف: {'✅' if cs else '❌'}", "vn_cs")],
-        [btn("▶️ شروع جستجو", "vn_go"), btn("❌ انصراف", "cancel")],
     ]
-    expected = tries * p
-    any_p = 1 - (1 - p) ** tries
+    if len(patterns) < VN_MAX_PATTERNS:
+        rows.append([btn("➕ افزودن الگوی دیگر", "vn_add")])
+    rows.append([btn(f"🗑 {i}", f"vn_rm:{i - 1}") for i in range(1, len(patterns) + 1)])
+    rows.append([btn("▶️ شروع جستجو", "vn_go"), btn("❌ انصراف", "cancel")])
+
+    speed = VN_STATS.get("speed")
+    if speed:
+        time_line = f"⏱ زمان تخمینی (حداکثر، طبق سرعت جستجوی قبلی): ~{fmt_dur(tries / speed)}\n"
+    else:
+        time_line = "⏱ سرعت واقعی بعد از شروع جستجو نمایش داده می‌شود.\n"
+
     text = (
         "🎯 <b>جستجوی آدرس خاص</b>\n\n"
-        f"حالت: {MODE_FA[mode]}\n"
-        f"الگو: <code>{html.escape(pat)}</code>\n"
+        f"📌 الگوها ({len(patterns)} از {VN_MAX_PATTERNS}):\n" + "\n".join(plines) + "\n"
+        "(با دکمه‌های 🗑 شماره‌دار می‌توانی الگو را حذف کنی)\n\n"
         f"حساس به حروف: {'✅' if cs else '❌ (بزرگ/کوچک فرقی ندارد)'}\n"
-        f"تعداد تلاش: <b>{tries:,}</b>\n\n"
-        f"🎲 احتمال هر تلاش: ۱ از {1 / p:,.0f}\n"
+        f"تعداد تلاش: <b>{tries:,}</b>\n"
+        f"🧵 پردازش هم‌زمان: {VN_WORKERS}\n\n"
+        f"🎲 احتمال هر تلاش (جور شدن با حداقل یکی از الگوها): ۱ از {1 / p_any:,.0f}\n"
         f"📊 تعداد مورد انتظار: {expected:.2f}\n"
         f"📈 احتمال پیدا شدن حداقل یکی: {any_p * 100:.1f}%\n"
+        f"{time_line}"
     )
     if expected < 0.5:
-        text += "\n⚠️ با این تعداد تلاش احتمالا چیزی پیدا نمی‌شود. الگو را کوتاه‌تر کن یا تعداد را بیشتر.\n"
+        text += "\n⚠️ با این تعداد تلاش احتمالا چیزی پیدا نمی‌شود. الگوها را کوتاه‌تر کن یا تعداد را بیشتر.\n"
     text += (
-        "\nفقط ولت‌هایی که الگو را دارند ذخیره و ارسال می‌شوند، بقیه دور ریخته می‌شوند.\n"
+        "\nفقط ولت‌هایی که حداقل با یکی از الگوها جور باشند ذخیره و ارسال می‌شوند، بقیه دور ریخته می‌شوند.\n"
         "هر وقت خواستی با دکمه‌ی «توقف» جستجو را متوقف کن."
     )
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1002,11 +1320,7 @@ def vn_view(data: dict):
 async def vn_show(target: Message, state: FSMContext, edit: bool) -> None:
     text, kb = vn_view(await state.get_data())
     if edit:
-        try:
-            await target.edit_text(text, reply_markup=kb)
-        except TelegramBadRequest as e:
-            if "not modified" not in str(e):
-                await target.answer(text, reply_markup=kb)
+        await safe_edit(target, text, kb)
     else:
         await target.answer(text, reply_markup=kb)
 
@@ -1015,60 +1329,149 @@ async def vn_show(target: Message, state: FSMContext, edit: bool) -> None:
 async def cb_vn(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.clear()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [btn("🔚 پایان آدرس", "vn_m:suffix"), btn("🔝 شروع آدرس", "vn_m:prefix")],
-            [btn("🔍 داخل آدرس", "vn_m:contains")],
-            [btn("❌ انصراف", "cancel")],
-        ]
-    )
-    await c.message.answer(
-        "🎯 <b>آدرس خاص</b>\nالگو را کجای آدرس می‌خواهی؟\n\n"
-        "پیشنهاد: «پایان آدرس» بهترین و راحت‌ترین حالت است.",
-        reply_markup=kb,
-    )
+    await state.update_data(patterns=[], tries=VN_TRIES[0], cs=False)
+    await c.message.answer(vn_mode_text([]), reply_markup=vn_mode_kb(back=False))
 
 
 @router.callback_query(F.data.startswith("vn_m:"))
 async def cb_vn_mode(c: CallbackQuery, state: FSMContext):
-    await c.answer()
     mode = c.data.split(":")[1]
     if mode not in MODE_FA:
+        await c.answer()
         return
-    await state.clear()
-    await state.update_data(mode=mode)
+    data = await state.get_data()
+    patterns = [list(x) for x in data.get("patterns", [])]
+    if len(patterns) >= VN_MAX_PATTERNS:
+        await c.answer(f"حداکثر {VN_MAX_PATTERNS} الگو.", show_alert=True)
+        return
+    await c.answer()
+    await state.update_data(
+        cur_mode=mode,
+        patterns=patterns,
+        tries=data.get("tries", VN_TRIES[0]),
+        cs=data.get("cs", False),
+    )
     await state.set_state(Vanity.pattern)
+    slots = VN_MAX_PATTERNS - len(patterns)
     extra = (
         "\n⚠️ حرف اول بعد از UQ فقط می‌تواند یکی از A تا D باشد."
         if mode == "prefix"
         else ""
     )
-    await c.message.answer(
-        f"✍️ الگو را بفرست (۱ تا ۸ کاراکتر: حروف انگلیسی، عدد، - و _).{extra}\n"
-        "مثال: <code>TON</code> یا <code>777</code>",
-        reply_markup=cancel_kb(),
+    kb_rows = [[btn("❌ انصراف", "cancel")]]
+    if patterns:
+        kb_rows[0].insert(0, btn("⬅️ برگشت", "vn_back"))
+    await safe_edit(
+        c.message,
+        f"✍️ الگو را بفرست ({MODE_FA[mode]}).\n"
+        "هر الگو ۱ تا ۸ کاراکتر: حروف انگلیسی، عدد، - و _\n"
+        f"می‌توانی چند الگو را با فاصله، ویرگول یا خط جدید جدا کنی؛ ظرفیت باقی‌مانده: {slots} از {VN_MAX_PATTERNS}."
+        f"{extra}\n"
+        "مثال: <code>TON 777 ABC</code>",
+        InlineKeyboardMarkup(inline_keyboard=kb_rows),
     )
 
 
 @router.message(StateFilter(Vanity.pattern), F.text)
 async def st_vn_pattern(m: Message, state: FSMContext):
-    pat = m.text.strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,8}", pat):
-        await m.answer(
-            "❌ الگو نامعتبر است. فقط حروف انگلیسی، عدد، - و _ (حداکثر ۸ کاراکتر):",
-            reply_markup=cancel_kb(),
-        )
-        return
     data = await state.get_data()
-    if vanity_probability(data["mode"], pat, False) == 0:
+    mode = data.get("cur_mode")
+    if mode not in MODE_FA:
+        await state.clear()
+        await m.answer("⚠️ اطلاعات ناقص بود. دوباره شروع کن.", reply_markup=main_menu())
+        return
+    patterns = [list(x) for x in data.get("patterns", [])]
+    cs = data.get("cs", False)
+    slots = VN_MAX_PATTERNS - len(patterns)
+
+    raw = [x for x in re.split(r"[\s,،;؛]+", m.text.strip()) if x]
+    if not raw:
+        await m.answer("❌ الگویی نفرستادی. دوباره بفرست:", reply_markup=cancel_kb())
+        return
+    bad = [x for x in raw if not re.fullmatch(r"[A-Za-z0-9_-]{1,8}", x)]
+    if bad:
+        shown = "، ".join(html.escape(x[:20]) for x in bad[:5])
         await m.answer(
-            "❌ حرف اول بعد از UQ فقط می‌تواند A تا D باشد. الگوی دیگری بفرست:",
+            f"❌ الگوی نامعتبر: {shown}\nفقط حروف انگلیسی، عدد، - و _ (حداکثر ۸ کاراکتر). دوباره بفرست:",
             reply_markup=cancel_kb(),
         )
         return
-    await state.update_data(pattern=pat, tries=VN_TRIES[0], cs=False)
+
+    norm = (lambda s: s) if cs else (lambda s: s.lower())
+    seen = {(pm, norm(pp)) for pm, pp in patterns}
+    new = []
+    for x in raw:
+        key = (mode, norm(x))
+        if key in seen:
+            continue
+        seen.add(key)
+        new.append(x)
+    if not new:
+        await m.answer("❌ این الگوها قبلا اضافه شده‌اند. الگوی دیگری بفرست:", reply_markup=cancel_kb())
+        return
+    if len(new) > slots:
+        await m.answer(
+            f"❌ فقط {slots} جای خالی داری ولی {len(new)} الگوی جدید فرستادی. تعدادش را کم کن:",
+            reply_markup=cancel_kb(),
+        )
+        return
+    impossible = [x for x in new if vanity_probability(mode, x, cs) == 0]
+    if impossible:
+        hint = (
+            "حرف اول بعد از UQ فقط می‌تواند A تا D باشد"
+            + (" (در حالت حساس به حروف، بزرگ)" if cs else "")
+        )
+        await m.answer(
+            f"❌ {hint}. الگوی نامعتبر: {'، '.join(html.escape(x) for x in impossible)}\nدوباره بفرست:",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    patterns += [[mode, x] for x in new]
+    await state.update_data(patterns=patterns, tries=data.get("tries", VN_TRIES[0]), cs=cs)
     await state.set_state(Vanity.confirm)
     await vn_show(m, state, edit=False)
+
+
+@router.callback_query(F.data == "vn_back", StateFilter(Vanity.confirm, Vanity.pattern))
+async def cb_vn_back(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    data = await state.get_data()
+    if not data.get("patterns"):
+        await safe_edit(c.message, vn_mode_text([]), vn_mode_kb(back=False))
+        return
+    await state.set_state(Vanity.confirm)
+    await vn_show(c.message, state, edit=True)
+
+
+@router.callback_query(F.data == "vn_add", StateFilter(Vanity.confirm))
+async def cb_vn_add(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    patterns = data.get("patterns", [])
+    if len(patterns) >= VN_MAX_PATTERNS:
+        await c.answer(f"حداکثر {VN_MAX_PATTERNS} الگو.", show_alert=True)
+        return
+    await c.answer()
+    await safe_edit(c.message, vn_mode_text(patterns), vn_mode_kb(back=True))
+
+
+@router.callback_query(F.data.startswith("vn_rm:"), StateFilter(Vanity.confirm))
+async def cb_vn_rm(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    try:
+        idx = int(c.data.split(":")[1])
+    except ValueError:
+        return
+    data = await state.get_data()
+    patterns = [list(x) for x in data.get("patterns", [])]
+    if not 0 <= idx < len(patterns):
+        return
+    patterns.pop(idx)
+    await state.update_data(patterns=patterns)
+    if patterns:
+        await vn_show(c.message, state, edit=True)
+    else:
+        await safe_edit(c.message, vn_mode_text([]), vn_mode_kb(back=False))
 
 
 @router.callback_query(F.data.startswith("vn_t:"), StateFilter(Vanity.confirm))
@@ -1082,12 +1485,12 @@ async def cb_vn_tries(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "vn_cs", StateFilter(Vanity.confirm))
 async def cb_vn_cs(c: CallbackQuery, state: FSMContext):
-    await c.answer()
     data = await state.get_data()
     new_cs = not data["cs"]
-    if vanity_probability(data["mode"], data["pattern"], new_cs) == 0:
-        await c.answer("با این حالت امکان‌پذیر نیست.", show_alert=True)
+    if any(vanity_probability(m, p, new_cs) == 0 for m, p in data["patterns"]):
+        await c.answer("با این حالت یکی از الگوها امکان‌پذیر نیست.", show_alert=True)
         return
+    await c.answer()
     await state.update_data(cs=new_cs)
     await vn_show(c.message, state, edit=True)
 
@@ -1100,66 +1503,78 @@ async def cb_vn_stop(c: CallbackQuery):
     await c.answer("در حال توقف…")
 
 
+def vn_summary_text(patterns: list, r: dict) -> str:
+    if r["stopped"]:
+        head = "⏹ جستجو متوقف شد."
+    elif r["capped"]:
+        head = f"🛑 به سقف {VN_MAX_FOUND} نتیجه رسید؛ جستجو متوقف شد."
+    else:
+        head = "✅ جستجو تمام شد."
+    speed = r["checked"] / r["elapsed"] if r["elapsed"] > 0 else 0.0
+    lines = [
+        head,
+        "",
+        f"📊 بررسی‌شده: {r['checked']:,}",
+        f"⏱ زمان: {fmt_dur(r['elapsed'])}",
+        f"⚡ میانگین سرعت: {speed:.1f} آدرس در ثانیه ({r['workers']} پردازش)",
+        f"🎯 مجموع پیدا شده: <b>{len(r['found'])}</b>",
+    ]
+    for (mode, pat), n in zip(patterns, r["counts"]):
+        lines.append(f"{'✅' if n else '❌'} <code>{html.escape(pat)}</code> ({MODE_SHORT[mode]}): {n}")
+    if r.get("warn"):
+        lines.append("\n⚠️ بعضی پردازش‌ها حین کار خطا دادند (نتایج ثبت‌شده معتبرند).")
+    return "\n".join(lines)
+
+
 @router.callback_query(F.data == "vn_go", StateFilter(Vanity.confirm))
 async def cb_vn_go(c: CallbackQuery, state: FSMContext):
     await c.answer()
     data = await state.get_data()
+    patterns = [(m, p) for m, p in data.get("patterns", [])]
+    if not patterns:
+        await c.message.answer("❌ هیچ الگویی انتخاب نشده.", reply_markup=cancel_kb())
+        return
+    tries, cs = data["tries"], data["cs"]
     await state.clear()
     if SEARCH_LOCK.locked():
         await c.message.answer("⏳ یک جستجوی دیگر در حال انجام است. صبر کن تمام شود.")
         return
-    mode, pat, tries, cs = data["mode"], data["pattern"], data["tries"], data["cs"]
-    progress = {"done": 0, "found": [], "stop": False}
+    progress = {"stop": False}
     VN_PROGRESS["cur"] = progress
     stop_kb = InlineKeyboardMarkup(inline_keyboard=[[btn("⏹ توقف", "vn_stop")]])
-    status = await c.message.answer("⏳ شروع جستجو…", reply_markup=stop_kb)
+    status = await c.message.answer(
+        f"⏳ در حال راه‌اندازی {VN_WORKERS} پردازش…", reply_markup=stop_kb
+    )
     async with SEARCH_LOCK:
-        task = asyncio.create_task(
-            asyncio.to_thread(vanity_search, mode, pat, cs, tries, progress)
-        )
-        last = ""
-        while True:
-            finished, _ = await asyncio.wait({task}, timeout=5)
-            text = (
-                f"🔎 جستجو… {progress['done']:,} / {tries:,}\n"
-                f"🎯 پیدا شده: {len(progress['found'])}"
-            )
-            if text != last and not finished:
-                last = text
-                try:
-                    await status.edit_text(text, reply_markup=stop_kb)
-                except TelegramBadRequest:
-                    pass
-            if finished:
-                break
+        r = await vn_run(patterns, cs, tries, progress, status, stop_kb)
     VN_PROGRESS.pop("cur", None)
-    err = progress.get("error")
-    if err:
+
+    if r["error"]:
         await status.edit_text(
-            f"❌ جستجو ناموفق بود:\n<code>{html.escape(err)[:1500]}</code>"
+            f"❌ جستجو ناموفق بود:\n<code>{html.escape(r['error'])[:1500]}</code>"
         )
         await c.message.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
         return
-    found = progress["found"]
-    done = progress["done"]
+    found = r["found"]
+    summary = vn_summary_text(patterns, r)
     if not found:
         await status.edit_text(
-            f"😕 بعد از {done:,} تلاش، آدرسی با الگوی «{html.escape(pat)}» پیدا نشد.\n"
-            "الگو را کوتاه‌تر کن یا تعداد تلاش را بیشتر."
+            summary + "\n\nآدرسی پیدا نشد. الگوها را کوتاه‌تر کن یا تعداد تلاش را بیشتر."
         )
         await c.message.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
         return
     save_wallets(found)
-    await status.edit_text(f"✅ بعد از {done:,} تلاش، {len(found)} آدرس خاص پیدا شد.")
+    await status.edit_text(summary)
     await send_wallet_files(
         c.message,
         found,
         f"🎯 {len(found)} آدرس خاص (آدرس + ۲۴ کلمه).\n"
         "⚠️ فایل را جای امن ذخیره کن و بعدش پیام را از چت پاک کن.",
+        r["labels"],
     )
     if len(found) <= 10:
         body = "\n\n".join(
-            f"<b>#{i}</b>\n<code>{a}</code>\n<code>{w}</code>"
+            f"<b>#{i}</b> — {html.escape(r['labels'].get(a, ''))}\n<code>{a}</code>\n<code>{w}</code>"
             for i, (a, w) in enumerate(found, 1)
         )
         shown = await c.message.answer(body + "\n\n⚠️ این پیام بعد از ۲ دقیقه پاک می‌شود.")
