@@ -2,13 +2,12 @@ import asyncio
 import html
 import io
 import logging
+import math
 import os
-import sqlite3
 import time
 from decimal import Decimal, InvalidOperation
 
 import httpx
-import qrcode
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -17,29 +16,33 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
-from cryptography.fernet import Fernet
-from dotenv import load_dotenv
+from aiohttp import web
+from tonsdk.boc import Cell
+from tonsdk.contract import Contract
 from tonsdk.contract.wallet import Wallets, WalletVersionEnum
 from tonsdk.utils import Address, bytes_to_b64str
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# ───────────────────────── تنظیمات ─────────────────────────
+# ───────────────────────── تنظیمات (از Environment) ─────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
-NETWORK = os.getenv("NETWORK", "mainnet").strip().lower()  # mainnet | testnet
-DB_PATH = os.getenv("DB_PATH", "wallet.db")
+MNEMONIC = " ".join(os.getenv("MNEMONIC", "").lower().split())
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # اختیاری
+NETWORK = os.getenv("NETWORK", "mainnet").strip().lower()  # اختیاری
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)  # بعد از اولین اجرا پر می‌کنی
+except ValueError:
+    OWNER_ID = 0
 
-if not BOT_TOKEN or not ENCRYPTION_KEY:
-    raise SystemExit("BOT_TOKEN و ENCRYPTION_KEY باید در فایل .env تنظیم شوند.")
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN تنظیم نشده.")
+if len(MNEMONIC.split()) != 24:
+    raise SystemExit("MNEMONIC باید دقیقا ۲۴ کلمه باشد (با فاصله بین کلمات).")
 
 IS_TEST = NETWORK == "testnet"
 API_BASE = (
@@ -47,82 +50,31 @@ API_BASE = (
     if IS_TEST
     else "https://toncenter.com/api/v2"
 )
-FEE_RESERVE = Decimal("0.01")  # کارمزد تقریبی شبکه
 NANO = Decimal(10**9)
-VERSION = WalletVersionEnum.v4r2
+FEE_PER_MSG = Decimal("0.01")  # تخمین محافظه‌کارانه کارمزد برای هر گیرنده
+BATCH_SIZE = 4  # حداکثر پیام در هر تراکنش ولت V4R2
+MAX_LINES = 200
 
-fernet = Fernet(ENCRYPTION_KEY.encode())
-router = Router()
-router.message.filter(F.chat.type == "private")
-SENDING: set[int] = set()
+_m, _pub, _priv, WALLET = Wallets.from_mnemonics(
+    MNEMONIC.split(), WalletVersionEnum.v4r2, 0
+)
+ADDRESS = WALLET.address.to_string(True, True, False, IS_TEST)
 
-
-# ───────────────────────── دیتابیس ─────────────────────────
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+SEND_LOCK = asyncio.Lock()
 
 
-def init_db() -> None:
-    with db() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                address TEXT NOT NULL,
-                mnemonic_enc TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )"""
-        )
-
-
-def get_user(uid: int):
-    with db() as conn:
-        return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-
-
-def save_user(uid: int, address: str, mnemonic_enc: str) -> None:
-    with db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, address, mnemonic_enc, created_at) VALUES (?,?,?,?)",
-            (uid, address, mnemonic_enc, int(time.time())),
-        )
-
-
-# ───────────────────────── رمزنگاری ─────────────────────────
-def encrypt(text: str) -> str:
-    return fernet.encrypt(text.encode()).decode()
-
-
-def decrypt(token: str) -> str:
-    return fernet.decrypt(token.encode()).decode()
-
-
-# ───────────────────────── ولت TON ─────────────────────────
-def create_wallet():
-    mnemonics, _pub, _priv, wallet = Wallets.create(VERSION, workchain=0)
-    address = wallet.address.to_string(True, True, False, IS_TEST)
-    return mnemonics, address
-
-
-def load_wallet(mnemonic_str: str):
-    _m, _pub, _priv, wallet = Wallets.from_mnemonics(
-        mnemonic_str.split(), VERSION, 0
-    )
-    return wallet
-
-
+# ───────────────────────── ارتباط با شبکه TON ─────────────────────────
 async def call(method: str, params: dict | None = None, body: dict | None = None):
     headers = {"X-API-Key": TONCENTER_API_KEY} if TONCENTER_API_KEY else {}
     url = f"{API_BASE}/{method}"
     async with httpx.AsyncClient(timeout=25) as client:
-        for _ in range(4):
+        for _ in range(5):
             if body is not None:
                 r = await client.post(url, json=body, headers=headers)
             else:
                 r = await client.get(url, params=params, headers=headers)
             if r.status_code == 429:
-                await asyncio.sleep(1.3)
+                await asyncio.sleep(1.5)
                 continue
             r.raise_for_status()
             data = r.json()
@@ -132,9 +84,14 @@ async def call(method: str, params: dict | None = None, body: dict | None = None
     raise RuntimeError("Toncenter rate limit")
 
 
-async def get_balance(address: str) -> Decimal:
-    nano = await call("getAddressBalance", {"address": address})
+async def get_balance() -> Decimal:
+    nano = await call("getAddressBalance", {"address": ADDRESS})
     return Decimal(int(nano)) / NANO
+
+
+async def get_seqno() -> int:
+    info = await call("getWalletInformation", {"address": ADDRESS})
+    return int(info.get("seqno") or 0)
 
 
 async def get_ton_price():
@@ -149,18 +106,38 @@ async def get_ton_price():
         return None
 
 
-async def send_ton(user_row, to_addr: str, amount: Decimal, comment: str | None):
-    wallet = load_wallet(decrypt(user_row["mnemonic_enc"]))
-    info = await call("getWalletInformation", {"address": user_row["address"]})
-    seqno = info.get("seqno") or 0
-    nano = int(amount * NANO)
-    query = wallet.create_transfer_message(
-        to_addr, nano, seqno, payload=comment or None, send_mode=3
-    )
-    boc = bytes_to_b64str(query["message"].to_boc(False))
+def build_order(to_addr: str, nano: int, comment: str | None):
+    payload = Cell()
+    if comment:
+        payload.bits.write_uint(0, 32)
+        payload.bits.write_bytes(comment.encode("utf-8"))
+    header = Contract.create_internal_message_header(Address(to_addr), nano)
+    return Contract.create_common_msg_info(header, None, payload)
+
+
+async def send_batch(chunk: list, seqno: int) -> None:
+    signing = WALLET.create_signing_message(seqno)
+    for addr, nano, comment in chunk:
+        signing.bits.write_uint8(3)  # pay fees separately + ignore errors
+        signing.refs.append(build_order(addr, nano, comment))
+    ext = WALLET.create_external_message(signing, seqno)
+    boc = bytes_to_b64str(ext["message"].to_boc(False))
     await call("sendBoc", body={"boc": boc})
 
 
+async def wait_seqno(old: int, timeout: int = 90) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        await asyncio.sleep(4)
+        try:
+            if await get_seqno() > old:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ───────────────────────── ابزارها ─────────────────────────
 def fmt(nano) -> str:
     v = Decimal(int(nano)) / NANO
     return f"{v:.4f}".rstrip("0").rstrip(".")
@@ -170,11 +147,42 @@ def short(addr: str) -> str:
     return f"{addr[:6]}…{addr[-6:]}"
 
 
+def parse_lines(text: str):
+    orders, errors = [], []
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            errors.append(f"خط {i}: فرمت اشتباه (آدرس و مبلغ لازمه)")
+            continue
+        addr, amt = parts[0], parts[1]
+        comment = parts[2].strip() if len(parts) > 2 else None
+        try:
+            Address(addr)
+        except Exception:
+            errors.append(f"خط {i}: آدرس نامعتبر")
+            continue
+        try:
+            amount = Decimal(amt.replace(",", ".")).quantize(Decimal("0.000000001"))
+            if amount <= 0:
+                raise InvalidOperation
+        except (InvalidOperation, ValueError):
+            errors.append(f"خط {i}: مبلغ نامعتبر")
+            continue
+        if comment and len(comment.encode("utf-8")) > 120:
+            errors.append(f"خط {i}: کامنت خیلی طولانیه")
+            continue
+        orders.append((addr, int(amount * NANO), comment))
+    if len(orders) > MAX_LINES:
+        errors.append(f"حداکثر {MAX_LINES} گیرنده مجازه.")
+    return orders, errors
+
+
 # ───────────────────────── رابط ─────────────────────────
-class SendFlow(StatesGroup):
-    address = State()
-    amount = State()
-    comment = State()
+class Multi(StatesGroup):
+    waiting = State()
     confirm = State()
 
 
@@ -185,9 +193,9 @@ def btn(text: str, data: str) -> InlineKeyboardButton:
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [btn("💰 موجودی", "balance"), btn("📥 دریافت", "receive")],
-            [btn("📤 ارسال", "send"), btn("📜 تاریخچه", "history")],
-            [btn("🔐 کلید بازیابی", "export")],
+            [btn("💰 موجودی", "balance"), btn("📍 آدرس", "address")],
+            [btn("📤 ارسال (تکی / گروهی)", "multi")],
+            [btn("📜 تاریخچه", "history")],
         ]
     )
 
@@ -196,53 +204,44 @@ def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[btn("❌ انصراف", "cancel")]])
 
 
-async def delete_later(msg: Message, seconds: int) -> None:
-    await asyncio.sleep(seconds)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+# ───────────────────────── قفل مالک ─────────────────────────
+guard = Router()
 
 
-async def need_user(c: CallbackQuery):
-    user = get_user(c.from_user.id)
-    if not user:
-        await c.message.answer("اول /start رو بزن و ولت بساز.")
-    return user
+def not_owner(event) -> bool:
+    return event.from_user is None or event.from_user.id != OWNER_ID
+
+
+@guard.message(F.chat.type == "private", not_owner)
+async def deny_msg(m: Message):
+    if OWNER_ID == 0:
+        await m.answer(
+            "🔧 تنظیم اولیه:\n"
+            f"آیدی عددی تلگرام تو: <code>{m.from_user.id}</code>\n\n"
+            "این عدد رو توی Render با اسم <code>OWNER_ID</code> اضافه کن و سرویس رو دوباره دیپلوی کن."
+        )
+    else:
+        await m.answer("⛔ این ربات خصوصیه.")
+
+
+@guard.callback_query(not_owner)
+async def deny_cb(c: CallbackQuery):
+    await c.answer("⛔", show_alert=True)
 
 
 # ───────────────────────── هندلرها ─────────────────────────
+router = Router()
+router.message.filter(F.chat.type == "private")
+
+
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    if not get_user(m.from_user.id):
-        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("✨ ساخت ولت", "create")]])
-        net = "🧪 (شبکه تست)" if IS_TEST else ""
-        await m.answer(
-            f"سلام 👋\nبه ربات ولت TON خوش اومدی {net}\nبرای شروع یه ولت بساز:",
-            reply_markup=kb,
-        )
-    else:
-        await m.answer("🏠 منوی اصلی", reply_markup=main_menu())
-
-
-@router.callback_query(F.data == "create")
-async def cb_create(c: CallbackQuery):
-    await c.answer()
-    if get_user(c.from_user.id):
-        await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
-        return
-    mnemonics, address = create_wallet()
-    save_user(c.from_user.id, address, encrypt(" ".join(mnemonics)))
-    sent = await c.message.answer(
-        "✅ ولت ساخته شد!\n\n"
-        f"📍 آدرس:\n<code>{address}</code>\n\n"
-        "🔐 <b>۲۴ کلمه بازیابی (همین الان جایی امن ذخیره کن):</b>\n"
-        f"<code>{' '.join(mnemonics)}</code>\n\n"
-        "⚠️ این پیام بعد از ۹۰ ثانیه پاک میشه. این کلمات رو به هیچ‌کس نده."
+    net = "🧪 تست‌نت" if IS_TEST else "🌐 مین‌نت"
+    await m.answer(
+        f"👋 ولت TON ({net})\n📍 آدرس:\n<code>{ADDRESS}</code>",
+        reply_markup=main_menu(),
     )
-    await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
-    asyncio.create_task(delete_later(sent, 90))
 
 
 @router.callback_query(F.data == "cancel")
@@ -252,15 +251,19 @@ async def cb_cancel(c: CallbackQuery, state: FSMContext):
     await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
 
 
+@router.callback_query(F.data == "address")
+async def cb_address(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    await c.message.answer(f"📍 آدرس ولت:\n<code>{ADDRESS}</code>", reply_markup=main_menu())
+
+
 @router.callback_query(F.data == "balance")
 async def cb_balance(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.clear()
-    user = await need_user(c)
-    if not user:
-        return
     try:
-        bal = await get_balance(user["address"])
+        bal = await get_balance()
     except Exception:
         await c.message.answer("⚠️ خطا در ارتباط با شبکه TON. دوباره تلاش کن.")
         return
@@ -272,33 +275,12 @@ async def cb_balance(c: CallbackQuery, state: FSMContext):
     await c.message.answer(text, reply_markup=main_menu())
 
 
-@router.callback_query(F.data == "receive")
-async def cb_receive(c: CallbackQuery, state: FSMContext):
-    await c.answer()
-    await state.clear()
-    user = await need_user(c)
-    if not user:
-        return
-    addr = user["address"]
-    img = qrcode.make(f"ton://transfer/{addr}")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    await c.message.answer_photo(
-        BufferedInputFile(buf.getvalue(), filename="qr.png"),
-        caption=f"📥 آدرس ولت تو:\n<code>{addr}</code>",
-        reply_markup=main_menu(),
-    )
-
-
 @router.callback_query(F.data == "history")
 async def cb_history(c: CallbackQuery, state: FSMContext):
     await c.answer()
     await state.clear()
-    user = await need_user(c)
-    if not user:
-        return
     try:
-        txs = await call("getTransactions", {"address": user["address"], "limit": 8})
+        txs = await call("getTransactions", {"address": ADDRESS, "limit": 10})
     except Exception:
         await c.message.answer("⚠️ خطا در دریافت تاریخچه.")
         return
@@ -310,157 +292,171 @@ async def cb_history(c: CallbackQuery, state: FSMContext):
         if outs:
             for o in outs:
                 lines.append(
-                    f"➖ {fmt(o['value'])} TON → <code>{short(o['destination'])}</code>\n    🕒 {t} UTC"
+                    f"➖ {fmt(o['value'])} TON → <code>{short(o['destination'])}</code>  🕒 {t} UTC"
                 )
         elif inm.get("source"):
             lines.append(
-                f"➕ {fmt(inm['value'])} TON ← <code>{short(inm['source'])}</code>\n    🕒 {t} UTC"
+                f"➕ {fmt(inm['value'])} TON ← <code>{short(inm['source'])}</code>  🕒 {t} UTC"
             )
-    text = "📜 آخرین تراکنش‌ها:\n\n" + "\n\n".join(lines) if lines else "📜 هنوز تراکنشی نداری."
+    text = "📜 آخرین تراکنش‌ها:\n\n" + "\n".join(lines) if lines else "📜 هنوز تراکنشی نیست."
     await c.message.answer(text, reply_markup=main_menu())
 
 
-@router.callback_query(F.data == "export")
-async def cb_export(c: CallbackQuery, state: FSMContext):
+# ───────────── ارسال گروهی ─────────────
+@router.callback_query(F.data == "multi")
+async def cb_multi(c: CallbackQuery, state: FSMContext):
     await c.answer()
-    await state.clear()
-    if not await need_user(c):
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[btn("✅ نمایش کلمات", "export_yes"), btn("❌ انصراف", "cancel")]]
-    )
+    await state.set_state(Multi.waiting)
     await c.message.answer(
-        "⚠️ هر کسی این ۲۴ کلمه رو ببینه کل دارایی تو رو برمی‌داره. مطمئنی؟",
-        reply_markup=kb,
-    )
-
-
-@router.callback_query(F.data == "export_yes")
-async def cb_export_yes(c: CallbackQuery):
-    await c.answer()
-    user = await need_user(c)
-    if not user:
-        return
-    sent = await c.message.answer(
-        "🔐 کلمات بازیابی:\n\n"
-        f"<code>{decrypt(user['mnemonic_enc'])}</code>\n\n"
-        "این پیام بعد از ۶۰ ثانیه پاک میشه."
-    )
-    asyncio.create_task(delete_later(sent, 60))
-
-
-# ───────────── جریان ارسال ─────────────
-@router.callback_query(F.data == "send")
-async def cb_send(c: CallbackQuery, state: FSMContext):
-    await c.answer()
-    if not await need_user(c):
-        return
-    await state.set_state(SendFlow.address)
-    await c.message.answer("📤 آدرس مقصد رو بفرست:", reply_markup=cancel_kb())
-
-
-@router.message(StateFilter(SendFlow.address), F.text)
-async def st_address(m: Message, state: FSMContext):
-    addr = m.text.strip()
-    try:
-        Address(addr)
-    except Exception:
-        await m.answer("❌ آدرس معتبر نیست. دوباره بفرست:", reply_markup=cancel_kb())
-        return
-    await state.update_data(address=addr)
-    await state.set_state(SendFlow.amount)
-    await m.answer("💎 مقدار TON رو بفرست (مثلا 1.5):", reply_markup=cancel_kb())
-
-
-@router.message(StateFilter(SendFlow.amount), F.text)
-async def st_amount(m: Message, state: FSMContext):
-    try:
-        amount = Decimal(m.text.strip().replace(",", ".")).quantize(Decimal("0.000000001"))
-        if amount <= 0:
-            raise InvalidOperation
-    except (InvalidOperation, ValueError):
-        await m.answer("❌ عدد معتبر نیست. دوباره بفرست:", reply_markup=cancel_kb())
-        return
-    user = get_user(m.from_user.id)
-    try:
-        bal = await get_balance(user["address"])
-    except Exception:
-        await m.answer("⚠️ خطا در ارتباط با شبکه TON. دوباره تلاش کن.")
-        return
-    if amount + FEE_RESERVE > bal:
-        await m.answer(
-            f"❌ موجودی کافی نیست.\nموجودی: {bal:.4f} TON\n(حدود {FEE_RESERVE} TON هم برای کارمزد لازمه)",
-            reply_markup=cancel_kb(),
-        )
-        return
-    await state.update_data(amount=str(amount))
-    await state.set_state(SendFlow.comment)
-    await m.answer(
-        "📝 کامنت (Memo) رو بفرست، یا برای رد کردن بزن <code>-</code>",
+        "📤 <b>ارسال</b>\n\n"
+        "هر خط یک گیرنده، با این فرمت:\n"
+        "<code>آدرس مبلغ</code>\n"
+        "یا با کامنت:\n"
+        "<code>آدرس مبلغ کامنت</code>\n\n"
+        "مثال:\n"
+        "<code>UQAbc...xyz 1.5\nUQDef...uvw 0.3 سلام</code>\n\n"
+        f"برای ارسال تکی فقط یک خط بفرست. حداکثر {MAX_LINES} خط.\n"
+        "می‌تونی لیست رو به‌صورت فایل .txt هم بفرستی.",
         reply_markup=cancel_kb(),
     )
 
 
-@router.message(StateFilter(SendFlow.comment), F.text)
-async def st_comment(m: Message, state: FSMContext):
-    comment = m.text.strip()
-    comment = None if comment == "-" else comment[:120]
-    await state.update_data(comment=comment)
-    data = await state.get_data()
-    await state.set_state(SendFlow.confirm)
+async def handle_list(m: Message, state: FSMContext, text: str):
+    orders, errors = parse_lines(text)
+    if errors or not orders:
+        msg = "❌ مشکل در لیست:\n" + "\n".join(html.escape(e) for e in errors[:10])
+        if not orders and not errors:
+            msg = "❌ لیست خالیه."
+        await m.answer(msg + "\n\nاصلاح کن و دوباره بفرست:", reply_markup=cancel_kb())
+        return
+    try:
+        bal = await get_balance()
+    except Exception:
+        await m.answer("⚠️ خطا در ارتباط با شبکه TON. دوباره تلاش کن.")
+        return
+    total = sum(Decimal(n) for _, n, _ in orders) / NANO
+    fees = FEE_PER_MSG * len(orders)
+    batches = math.ceil(len(orders) / BATCH_SIZE)
+    if total + fees > bal:
+        await m.answer(
+            f"❌ موجودی کافی نیست.\nموجودی: {bal:.4f}\nجمع ارسال: {total:.4f}\n"
+            f"کارمزد تخمینی: {fees:.2f}\n\nلیست جدید بفرست:",
+            reply_markup=cancel_kb(),
+        )
+        return
+    await state.update_data(orders=[[a, str(n), c] for a, n, c in orders])
+    await state.set_state(Multi.confirm)
+    preview = "\n".join(
+        f"{i}. <code>{short(a)}</code> ← {fmt(n)} TON" + (f" 📝 {html.escape(c)}" if c else "")
+        for i, (a, n, c) in enumerate(orders[:10], 1)
+    )
+    if len(orders) > 10:
+        preview += f"\n… و {len(orders) - 10} گیرنده دیگر"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[btn("✅ تایید و ارسال", "confirm_send"), btn("❌ انصراف", "cancel")]]
     )
     await m.answer(
-        "🔎 بررسی نهایی:\n\n"
-        f"به: <code>{data['address']}</code>\n"
-        f"مقدار: <b>{data['amount']} TON</b>\n"
-        f"کامنت: {html.escape(comment) if comment else '—'}\n\n"
-        "تراکنش برگشت‌پذیر نیست.",
+        f"🔎 <b>بررسی نهایی</b>\n\n{preview}\n\n"
+        f"👥 گیرنده‌ها: {len(orders)}\n"
+        f"💎 جمع: <b>{total:.4f} TON</b>\n"
+        f"⛽ کارمزد تقریبی: کمتر از {fees:.2f} TON\n"
+        f"📦 تعداد تراکنش: {batches}\n\n"
+        "تراکنش‌ها برگشت‌پذیر نیستند.",
         reply_markup=kb,
     )
 
 
-@router.callback_query(F.data == "confirm_send", StateFilter(SendFlow.confirm))
+@router.message(StateFilter(Multi.waiting), F.text)
+async def st_text(m: Message, state: FSMContext):
+    await handle_list(m, state, m.text)
+
+
+@router.message(StateFilter(Multi.waiting), F.document)
+async def st_doc(m: Message, state: FSMContext):
+    if m.document.file_size and m.document.file_size > 1_000_000:
+        await m.answer("❌ فایل خیلی بزرگه.", reply_markup=cancel_kb())
+        return
+    buf = io.BytesIO()
+    await m.bot.download(m.document, destination=buf)
+    try:
+        text = buf.getvalue().decode("utf-8")
+    except UnicodeDecodeError:
+        await m.answer("❌ فایل باید متنی (UTF-8) باشه.", reply_markup=cancel_kb())
+        return
+    await handle_list(m, state, text)
+
+
+@router.callback_query(F.data == "confirm_send", StateFilter(Multi.confirm))
 async def cb_confirm(c: CallbackQuery, state: FSMContext):
     await c.answer()
-    uid = c.from_user.id
-    if uid in SENDING:
-        return
-    user = get_user(uid)
     data = await state.get_data()
     await state.clear()
-    if not user or "address" not in data:
-        await c.message.answer("⚠️ اطلاعات ناقص بود. دوباره از اول شروع کن.")
+    raw = data.get("orders")
+    if not raw:
+        await c.message.answer("⚠️ اطلاعات ناقص بود. دوباره شروع کن.", reply_markup=main_menu())
         return
-    SENDING.add(uid)
-    try:
-        await send_ton(user, data["address"], Decimal(data["amount"]), data.get("comment"))
-        await c.message.answer(
-            "✅ تراکنش ارسال شد. چند ثانیه تا چند دقیقه طول می‌کشه تا تایید بشه.",
-            reply_markup=main_menu(),
-        )
-    except Exception as e:
-        logging.exception("send failed")
-        await c.message.answer(f"❌ ارسال ناموفق بود: {html.escape(str(e))[:200]}", reply_markup=main_menu())
-    finally:
-        SENDING.discard(uid)
+    if SEND_LOCK.locked():
+        await c.message.answer("⏳ یک ارسال دیگه در حال انجامه. صبر کن تموم شه.")
+        return
+    orders = [(a, int(n), cm) for a, n, cm in raw]
+    batches = [orders[i : i + BATCH_SIZE] for i in range(0, len(orders), BATCH_SIZE)]
+    status = await c.message.answer(f"⏳ شروع ارسال… (0/{len(batches)})")
+    async with SEND_LOCK:
+        for idx, chunk in enumerate(batches, 1):
+            try:
+                seqno = await get_seqno()
+                await send_batch(chunk, seqno)
+                ok = await wait_seqno(seqno)
+            except Exception as e:
+                logging.exception("batch failed")
+                await status.edit_text(
+                    f"❌ خطا در تراکنش {idx}/{len(batches)}:\n{html.escape(str(e))[:200]}\n"
+                    "ارسال متوقف شد. قبل از تلاش مجدد تاریخچه رو چک کن."
+                )
+                await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
+                return
+            if not ok:
+                await status.edit_text(
+                    f"⚠️ تراکنش {idx}/{len(batches)} هنوز تایید نشد.\n"
+                    "برای جلوگیری از ارسال تکراری، ادامه داده نشد. تاریخچه رو چک کن."
+                )
+                await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
+                return
+            await status.edit_text(f"⏳ در حال ارسال… ({idx}/{len(batches)})")
+    await status.edit_text(f"✅ همه {len(orders)} انتقال ارسال شد.")
+    await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
 
 
 @router.message()
 async def fallback(m: Message, state: FSMContext):
     if await state.get_state() is None:
-        await m.answer("از منو استفاده کن 👇", reply_markup=main_menu() if get_user(m.from_user.id) else None)
+        await m.answer("از منو استفاده کن 👇", reply_markup=main_menu())
 
 
 # ───────────────────────── اجرا ─────────────────────────
+async def health(_request):
+    return web.Response(text="ok")
+
+
+async def start_web():
+    port = os.getenv("PORT")  # Render روی Web Service این رو خودش می‌گذارد
+    if not port:
+        return
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+
+
 async def main():
-    init_db()
+    await start_web()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(guard)
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bot started (%s)", NETWORK)
+    logging.info("Bot started | wallet %s | owner %s", ADDRESS, OWNER_ID or "NOT SET")
     await dp.start_polling(bot)
 
 
