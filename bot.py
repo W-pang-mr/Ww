@@ -41,17 +41,22 @@ logging.basicConfig(level=logging.INFO)
 # ───────────────────────── تنظیمات (از Environment) ─────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MNEMONIC = " ".join(os.getenv("MNEMONIC", "").lower().split())
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()  # اختیاری
-NETWORK = os.getenv("NETWORK", "mainnet").strip().lower()  # اختیاری
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
+NETWORK = os.getenv("NETWORK", "mainnet").strip().lower()
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 try:
-    OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)  # بعد از اولین اجرا پر می‌کنی
+    OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 except ValueError:
     OWNER_ID = 0
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN تنظیم نشده.")
 if len(MNEMONIC.split()) != 24:
-    raise SystemExit("MNEMONIC باید دقیقا ۲۴ کلمه باشد (با فاصله بین کلمات).")
+    raise SystemExit("MNEMONIC باید دقیقا ۲۴ کلمه باشد.")
+
+if not ENCRYPTION_KEY:
+    ENCRYPTION_KEY = "walletbot:" + MNEMONIC
+    logging.warning("ENCRYPTION_KEY تنظیم نشده؛ از MNEMONIC مشتق می‌شود.")
 
 IS_TEST = NETWORK == "testnet"
 API_BASE = (
@@ -60,8 +65,8 @@ API_BASE = (
     else "https://toncenter.com/api/v2"
 )
 NANO = Decimal(10**9)
-FEE_PER_MSG = Decimal("0.01")  # تخمین محافظه‌کارانه کارمزد برای هر گیرنده
-BATCH_SIZE = 4  # حداکثر پیام در هر تراکنش ولت V4R2
+FEE_PER_MSG = Decimal("0.005")
+BATCH_SIZE = 4
 MAX_LINES = 200
 
 _m, _pub, _priv, WALLET = Wallets.from_mnemonics(
@@ -77,13 +82,13 @@ async def call(method: str, params: dict | None = None, body: dict | None = None
     headers = {"X-API-Key": TONCENTER_API_KEY} if TONCENTER_API_KEY else {}
     url = f"{API_BASE}/{method}"
     async with httpx.AsyncClient(timeout=25) as client:
-        for _ in range(5):
+        for attempt in range(5):
             if body is not None:
                 r = await client.post(url, json=body, headers=headers)
             else:
                 r = await client.get(url, params=params, headers=headers)
             if r.status_code == 429:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.5 * (attempt + 1))
                 continue
             r.raise_for_status()
             data = r.json()
@@ -110,6 +115,7 @@ async def get_ton_price():
                 "https://api.coingecko.com/api/v3/simple/price",
                 params={"ids": "the-open-network", "vs_currencies": "usd"},
             )
+            r.raise_for_status()
             return Decimal(str(r.json()["the-open-network"]["usd"]))
     except Exception:
         return None
@@ -127,22 +133,24 @@ def build_order(to_addr: str, nano: int, comment: str | None):
 async def send_batch(chunk: list, seqno: int) -> None:
     signing = WALLET.create_signing_message(seqno)
     for addr, nano, comment in chunk:
-        signing.bits.write_uint8(3)  # pay fees separately + ignore errors
+        signing.bits.write_uint8(3)
         signing.refs.append(build_order(addr, nano, comment))
     ext = WALLET.create_external_message(signing, seqno)
     boc = bytes_to_b64str(ext["message"].to_boc(False))
     await call("sendBoc", body={"boc": boc})
 
 
-async def wait_seqno(old: int, timeout: int = 90) -> bool:
+async def wait_seqno(old: int, timeout: int = 120) -> bool:
     end = time.time() + timeout
+    delay = 1.0
     while time.time() < end:
-        await asyncio.sleep(4)
+        await asyncio.sleep(delay)
         try:
             if await get_seqno() > old:
                 return True
         except Exception:
-            continue
+            pass
+        delay = min(delay * 1.5, 5.0)
     return False
 
 
@@ -158,6 +166,7 @@ def short(addr: str) -> str:
 
 def parse_lines(text: str):
     orders, errors = [], []
+    seen = set()
     for i, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line:
@@ -173,6 +182,10 @@ def parse_lines(text: str):
         except Exception:
             errors.append(f"خط {i}: آدرس نامعتبر")
             continue
+        if addr in seen:
+            errors.append(f"خط {i}: آدرس تکراری (نادیده گرفته شد)")
+            continue
+        seen.add(addr)
         try:
             amount = Decimal(amt.replace(",", ".")).quantize(Decimal("0.000000001"))
             if amount <= 0:
@@ -187,9 +200,7 @@ def parse_lines(text: str):
     if len(orders) > MAX_LINES:
         errors.append(f"حداکثر {MAX_LINES} گیرنده مجازه.")
     return orders, errors
-
-
-# ───────────────────────── رابط ─────────────────────────
+    # ───────────────────────── رابط ─────────────────────────
 class Multi(StatesGroup):
     waiting = State()
     confirm = State()
@@ -394,6 +405,10 @@ async def st_doc(m: Message, state: FSMContext):
     if m.document.file_size and m.document.file_size > 1_000_000:
         await m.answer("❌ فایل خیلی بزرگه.", reply_markup=cancel_kb())
         return
+    mime = (m.document.mime_type or "").lower()
+    if mime and not (mime.startswith("text/") or mime in ("application/octet-stream",)):
+        await m.answer("❌ فایل باید متنی (txt) باشه.", reply_markup=cancel_kb())
+        return
     buf = io.BytesIO()
     await m.bot.download(m.document, destination=buf)
     try:
@@ -443,16 +458,14 @@ async def cb_confirm(c: CallbackQuery, state: FSMContext):
             await status.edit_text(f"⏳ در حال ارسال… ({idx}/{len(batches)})")
     await status.edit_text(f"✅ همه {len(orders)} انتقال ارسال شد.")
     await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
-
-
-# ───────────── ولت‌های V5R1 (ساخت، ذخیره، حذف) ─────────────
+    # ───────────── ولت‌های V5R1 (ساخت، ذخیره، حذف) ─────────────
 MAX_GEN = 500
 PAGE_SIZE = 10
 DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 DB_PATH = os.getenv("DB_PATH", "wallets.db")
-PERSISTENT = os.path.isabs(DB_PATH)  # مثلا /data/wallets.db روی دیسک ماندگار
+PERSISTENT = os.path.isabs(DB_PATH)
 FERNET = Fernet(
-    base64.urlsafe_b64encode(hashlib.sha256(("walletbot:" + MNEMONIC).encode()).digest())
+    base64.urlsafe_b64encode(hashlib.sha256(ENCRYPTION_KEY.encode()).digest())
 )
 
 
@@ -464,7 +477,7 @@ def decrypt(token: str) -> str:
     try:
         return FERNET.decrypt(token.encode()).decode()
     except Exception:
-        return "❌ رمزگشایی ناموفق (MNEMONIC عوض شده؟)"
+        return "❌ رمزگشایی ناموفق (کلید رمزنگاری عوض شده؟)"
 
 
 def db_exec(sql: str, args=(), fetch: bool = False):
@@ -525,8 +538,11 @@ def all_wallets():
     return [(r["address"], decrypt(r["mnemonic_enc"])) for r in rows]
 
 
+# ───────────── کش سراسری سازنده‌ی ولت ─────────────
+_CREATOR = {"cls": None, "client": None, "first": None, "make": None}
+
+
 def _find_wallet_class():
-    """کلاس WalletV5R1 را در هر نسخه‌ی tonutils پیدا می‌کند."""
     import importlib
     import pkgutil
 
@@ -572,7 +588,6 @@ def _network_value(testnet: bool):
 
 
 def _build_clients():
-    """کلاینت‌های tonutils را (بدون اتصال به شبکه) می‌سازد؛ فقط برای ساختن ولت لازم است."""
     import importlib
     import inspect
     import pkgutil
@@ -645,7 +660,10 @@ def _create_one(cls, client):
 
 
 def _get_creator():
-    """تابعی برمی‌گرداند که هر بار یک ولت V5R1 (address, words) می‌سازد."""
+    """سازنده‌ی ولت را یک بار می‌سازد و cache می‌کند."""
+    if _CREATOR["make"] is not None:
+        return _CREATOR["make"], _CREATOR["first"]
+
     import inspect
 
     cls = _find_wallet_class()
@@ -667,25 +685,28 @@ def _get_creator():
             f"create failed | sig={sig} | clients={','.join(client_names)} | "
             + " || ".join(errors)
         )
-    return (lambda: _create_one(cls, working)), first
+
+    _CREATOR["cls"] = cls
+    _CREATOR["client"] = working
+    _CREATOR["first"] = first
+    _CREATOR["make"] = lambda: _create_one(cls, working)
+    return _CREATOR["make"], first
 
 
 def generate_wallets(n: int):
-    """n ولت V5R1 با ۲۴ کلمه می‌سازد. خروجی: لیست (address, mnemonic)."""
+    """n ولت V5R1 می‌سازد. برای n بزرگ از multiprocessing استفاده می‌کند."""
     make, first = _get_creator()
+    if n <= 1:
+        return [first]
     return [first] + [make() for _ in range(n - 1)]
-
-
-# ───────────── جستجوی آدرس خاص (Vanity) — چندالگویی و چندپردازشی ─────────────
-# تا ۵ الگو هم‌زمان؛ هر آدرس ساخته‌شده با همه‌ی الگوها مقایسه می‌شود.
-# ساخت ولت (PBKDF2 سنگین) روی چند پردازش جدا موازی می‌شود تا از همه‌ی هسته‌ها استفاده شود.
+    # ───────────── جستجوی آدرس خاص (Vanity) ─────────────
 VN_TRIES = (1000, 5000, 20000, 100000)
-VN_MAX_PATTERNS = 5  # حداکثر تعداد الگو در یک جستجو
-VN_MAX_FOUND = 300  # سقف نتایج؛ با رسیدن به آن جستجو خودکار متوقف می‌شود
-VN_CHUNK = 4  # هر پردازش در هر نوبت این تعداد تلاش را برمی‌دارد
-VN_UPDATE_EVERY = 3.0  # فاصله‌ی به‌روزرسانی پیام وضعیت (ثانیه)
+VN_MAX_PATTERNS = 5
+VN_MAX_FOUND = 300
+VN_CHUNK = 20
+VN_UPDATE_EVERY = 3.0
 VN_PROGRESS: dict = {}
-VN_STATS: dict = {}  # سرعت آخرین جستجو (برای تخمین زمان)
+VN_STATS: dict = {}
 SEARCH_LOCK = asyncio.Lock()
 
 MODE_FA = {
@@ -704,20 +725,18 @@ def _cpu_count() -> int:
 
 
 def _workers() -> int:
-    """تعداد پردازش‌ها: پیش‌فرض min(4, هسته‌ها)؛ با Environment به اسم VN_WORKERS قابل تغییر."""
     try:
         env = int(os.getenv("VN_WORKERS", "0") or 0)
     except ValueError:
         env = 0
-    n = env if env > 0 else min(4, _cpu_count())
-    return max(1, min(n, 16))
+    n = env if env > 0 else _cpu_count()
+    return max(1, min(n, 32))
 
 
 VN_WORKERS = _workers()
 
 
 def vanity_hits(addr: str, specs: list, cs: bool) -> list:
-    """اندیس همه‌ی الگوهایی که با این آدرس جور هستند (لیست خالی = هیچ‌کدام)."""
     a = addr if cs else addr.lower()
     hits = []
     for i, (mode, q) in enumerate(specs):
@@ -750,7 +769,6 @@ def vanity_probability(mode: str, pat: str, cs: bool) -> float:
 
 
 def vanity_worker(specs, cs, tries, claimed, checked, nfound, stop, out_q, err_q) -> None:
-    """یک پردازش جدا: ولت می‌سازد و با همه‌ی الگوها مقایسه می‌کند."""
     try:
         make, pending = _get_creator()
         while not stop.is_set():
@@ -775,7 +793,7 @@ def vanity_worker(specs, cs, tries, claimed, checked, nfound, stop, out_q, err_q
                         nfound.value += 1
                         if nfound.value >= VN_MAX_FOUND:
                             stop.set()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         err_q.put(repr(e)[:1500])
 
 
@@ -831,7 +849,7 @@ def vn_stop_workers(st: dict) -> None:
         try:
             q.close()
             q.cancel_join_thread()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -895,7 +913,6 @@ def vn_progress_text(
 
 
 async def vn_run(patterns: list, cs: bool, tries: int, progress: dict, status: Message, stop_kb) -> dict:
-    """جستجو را اجرا می‌کند و پیام وضعیت را زنده به‌روز نگه می‌دارد."""
     specs = [(m, p if cs else p.lower()) for m, p in patterns]
     counts = [0] * len(patterns)
     found: list = []
@@ -943,7 +960,7 @@ async def vn_run(patterns: list, cs: bool, tries: int, progress: dict, status: M
                 )
                 try:
                     await status.edit_text(text, reply_markup=stop_kb)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
             if not alive:
                 break
@@ -959,7 +976,7 @@ async def vn_run(patterns: list, cs: bool, tries: int, progress: dict, status: M
                 err = msg
             else:
                 warn = msg
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logging.exception("vanity search failed")
         err = repr(e)
     finally:
@@ -1015,9 +1032,7 @@ async def send_wallet_files(m: Message, wallets: list, caption: str, labels: dic
         BufferedInputFile(csv.encode("utf-8"), filename=f"wallets-{stamp}.csv"),
         caption="همان لیست به فرمت CSV",
     )
-
-
-def wl_menu_kb() -> InlineKeyboardMarkup:
+    def wl_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [btn("➕ ساخت ولت جدید", "gen"), btn("🎯 آدرس خاص", "vn")],
@@ -1292,7 +1307,7 @@ def vn_view(data: dict):
 
     speed = VN_STATS.get("speed")
     if speed:
-        time_line = f"⏱ زمان تخمینی (حداکثر، طبق سرعت جستجوی قبلی): ~{fmt_dur(tries / speed)}\n"
+        time_line = f"⏱ زمان تخمینی (حداکثر): ~{fmt_dur(tries / speed)}\n"
     else:
         time_line = "⏱ سرعت واقعی بعد از شروع جستجو نمایش داده می‌شود.\n"
 
@@ -1303,7 +1318,7 @@ def vn_view(data: dict):
         f"حساس به حروف: {'✅' if cs else '❌ (بزرگ/کوچک فرقی ندارد)'}\n"
         f"تعداد تلاش: <b>{tries:,}</b>\n"
         f"🧵 پردازش هم‌زمان: {VN_WORKERS}\n\n"
-        f"🎲 احتمال هر تلاش (جور شدن با حداقل یکی از الگوها): ۱ از {1 / p_any:,.0f}\n"
+        f"🎲 احتمال هر تلاش: ۱ از {1 / p_any:,.0f}\n"
         f"📊 تعداد مورد انتظار: {expected:.2f}\n"
         f"📈 احتمال پیدا شدن حداقل یکی: {any_p * 100:.1f}%\n"
         f"{time_line}"
@@ -1311,7 +1326,7 @@ def vn_view(data: dict):
     if expected < 0.5:
         text += "\n⚠️ با این تعداد تلاش احتمالا چیزی پیدا نمی‌شود. الگوها را کوتاه‌تر کن یا تعداد را بیشتر.\n"
     text += (
-        "\nفقط ولت‌هایی که حداقل با یکی از الگوها جور باشند ذخیره و ارسال می‌شوند، بقیه دور ریخته می‌شوند.\n"
+        "\nفقط ولت‌هایی که حداقل با یکی از الگوها جور باشند ذخیره و ارسال می‌شوند.\n"
         "هر وقت خواستی با دکمه‌ی «توقف» جستجو را متوقف کن."
     )
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1594,7 +1609,7 @@ async def health(_request):
 
 
 async def start_web():
-    port = os.getenv("PORT")  # Render روی Web Service این رو خودش می‌گذارد
+    port = os.getenv("PORT")
     if not port:
         return
     app = web.Application()
