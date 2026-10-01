@@ -6,6 +6,7 @@ import io
 import logging
 import math
 import os
+import re
 import sqlite3
 import time
 from decimal import Decimal, InvalidOperation
@@ -14,6 +15,7 @@ import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -193,6 +195,11 @@ class Multi(StatesGroup):
 
 class GenWallets(StatesGroup):
     count = State()
+
+
+class Vanity(StatesGroup):
+    pattern = State()
+    confirm = State()
 
 
 def btn(text: str, data: str) -> InlineKeyboardButton:
@@ -635,8 +642,8 @@ def _create_one(cls, client):
     return addr, words
 
 
-def generate_wallets(n: int):
-    """n ولت V5R1 با ۲۴ کلمه می‌سازد. خروجی: لیست (address, mnemonic)."""
+def _get_creator():
+    """تابعی برمی‌گرداند که هر بار یک ولت V5R1 (address, words) می‌سازد."""
     import inspect
 
     cls = _find_wallet_class()
@@ -658,10 +665,63 @@ def generate_wallets(n: int):
             f"create failed | sig={sig} | clients={','.join(client_names)} | "
             + " || ".join(errors)
         )
-    result = [first]
-    for _ in range(n - 1):
-        result.append(_create_one(cls, working))
-    return result
+    return (lambda: _create_one(cls, working)), first
+
+
+def generate_wallets(n: int):
+    """n ولت V5R1 با ۲۴ کلمه می‌سازد. خروجی: لیست (address, mnemonic)."""
+    make, first = _get_creator()
+    return [first] + [make() for _ in range(n - 1)]
+
+
+# ───────────── جستجوی آدرس خاص (Vanity) ─────────────
+VN_MAX_SECONDS = 1200
+VN_TRIES = (1000, 5000, 20000)
+VN_PROGRESS: dict = {}
+SEARCH_LOCK = asyncio.Lock()
+
+
+def vanity_match(addr: str, mode: str, pat: str, cs: bool) -> bool:
+    a = addr if cs else addr.lower()
+    q = pat if cs else pat.lower()
+    if mode == "prefix":
+        return a[2:].startswith(q)
+    if mode == "suffix":
+        return a.endswith(q)
+    return q in a[3:]
+
+
+def vanity_probability(mode: str, pat: str, cs: bool) -> float:
+    p = 1.0
+    for i, ch in enumerate(pat):
+        if mode == "prefix" and i == 0:
+            ok = ch in "ABCD" or (not cs and ch.upper() in "ABCD")
+            if not ok:
+                return 0.0
+            p *= 1 / 4
+        elif not cs and ch.isalpha():
+            p *= 2 / 64
+        else:
+            p *= 1 / 64
+    if mode == "contains":
+        p = min(1.0, p * max(1, 46 - len(pat) + 1))
+    return p
+
+
+def vanity_search(mode: str, pat: str, cs: bool, tries: int, progress: dict) -> None:
+    try:
+        make, first = _get_creator()
+        start = time.time()
+        for i in range(tries):
+            if progress["stop"] or time.time() - start > VN_MAX_SECONDS:
+                break
+            item = first if i == 0 else make()
+            progress["done"] = i + 1
+            if vanity_match(item[0], mode, pat, cs):
+                progress["found"].append(item)
+    except Exception as e:
+        logging.exception("vanity search failed")
+        progress["error"] = repr(e)
 
 
 async def delete_later(msg: Message, seconds: int) -> None:
@@ -693,7 +753,7 @@ async def send_wallet_files(m: Message, wallets: list, caption: str) -> None:
 def wl_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [btn("➕ ساخت ولت جدید", "gen")],
+            [btn("➕ ساخت ولت جدید", "gen"), btn("🎯 آدرس خاص", "vn")],
             [btn("📋 لیست ولت‌ها", "wl_list:0"), btn("📥 دریافت همه (فایل)", "wl_export")],
             [btn("🗑 حذف همه", "wl_delall")],
             [btn("🏠 منوی اصلی", "home")],
@@ -897,6 +957,215 @@ async def cb_wl_delallyes(c: CallbackQuery):
     await c.answer()
     db_exec("DELETE FROM wallets")
     await c.message.answer("✅ همه ولت‌ها حذف شدند.", reply_markup=wl_menu_kb())
+
+
+# ───────────── هندلرهای آدرس خاص ─────────────
+MODE_FA = {
+    "prefix": "شروع آدرس (بعد از UQ)",
+    "suffix": "پایان آدرس",
+    "contains": "داخل آدرس",
+}
+
+
+def vn_view(data: dict):
+    mode, pat = data["mode"], data["pattern"]
+    tries, cs = data["tries"], data["cs"]
+    p = vanity_probability(mode, pat, cs)
+    rows = [
+        [
+            btn(("✅ " if tries == t else "") + f"{t:,}", f"vn_t:{t}")
+            for t in VN_TRIES
+        ],
+        [btn(f"🔠 حساس به حروف: {'✅' if cs else '❌'}", "vn_cs")],
+        [btn("▶️ شروع جستجو", "vn_go"), btn("❌ انصراف", "cancel")],
+    ]
+    expected = tries * p
+    any_p = 1 - (1 - p) ** tries
+    text = (
+        "🎯 <b>جستجوی آدرس خاص</b>\n\n"
+        f"حالت: {MODE_FA[mode]}\n"
+        f"الگو: <code>{html.escape(pat)}</code>\n"
+        f"حساس به حروف: {'✅' if cs else '❌ (بزرگ/کوچک فرقی ندارد)'}\n"
+        f"تعداد تلاش: <b>{tries:,}</b>\n\n"
+        f"🎲 احتمال هر تلاش: ۱ از {1 / p:,.0f}\n"
+        f"📊 تعداد مورد انتظار: {expected:.2f}\n"
+        f"📈 احتمال پیدا شدن حداقل یکی: {any_p * 100:.1f}%\n"
+    )
+    if expected < 0.5:
+        text += "\n⚠️ با این تعداد تلاش احتمالا چیزی پیدا نمی‌شود. الگو را کوتاه‌تر کن یا تعداد را بیشتر.\n"
+    text += (
+        "\nفقط ولت‌هایی که الگو را دارند ذخیره و ارسال می‌شوند، بقیه دور ریخته می‌شوند.\n"
+        "حداکثر زمان جستجو: ۲۰ دقیقه."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def vn_show(target: Message, state: FSMContext, edit: bool) -> None:
+    text, kb = vn_view(await state.get_data())
+    if edit:
+        try:
+            await target.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest as e:
+            if "not modified" not in str(e):
+                await target.answer(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "vn")
+async def cb_vn(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("🔚 پایان آدرس", "vn_m:suffix"), btn("🔝 شروع آدرس", "vn_m:prefix")],
+            [btn("🔍 داخل آدرس", "vn_m:contains")],
+            [btn("❌ انصراف", "cancel")],
+        ]
+    )
+    await c.message.answer(
+        "🎯 <b>آدرس خاص</b>\nالگو را کجای آدرس می‌خواهی؟\n\n"
+        "پیشنهاد: «پایان آدرس» بهترین و راحت‌ترین حالت است.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("vn_m:"))
+async def cb_vn_mode(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    mode = c.data.split(":")[1]
+    if mode not in MODE_FA:
+        return
+    await state.clear()
+    await state.update_data(mode=mode)
+    await state.set_state(Vanity.pattern)
+    extra = (
+        "\n⚠️ حرف اول بعد از UQ فقط می‌تواند یکی از A تا D باشد."
+        if mode == "prefix"
+        else ""
+    )
+    await c.message.answer(
+        f"✍️ الگو را بفرست (۱ تا ۸ کاراکتر: حروف انگلیسی، عدد، - و _).{extra}\n"
+        "مثال: <code>TON</code> یا <code>777</code>",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(StateFilter(Vanity.pattern), F.text)
+async def st_vn_pattern(m: Message, state: FSMContext):
+    pat = m.text.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,8}", pat):
+        await m.answer(
+            "❌ الگو نامعتبر است. فقط حروف انگلیسی، عدد، - و _ (حداکثر ۸ کاراکتر):",
+            reply_markup=cancel_kb(),
+        )
+        return
+    data = await state.get_data()
+    if vanity_probability(data["mode"], pat, False) == 0:
+        await m.answer(
+            "❌ حرف اول بعد از UQ فقط می‌تواند A تا D باشد. الگوی دیگری بفرست:",
+            reply_markup=cancel_kb(),
+        )
+        return
+    await state.update_data(pattern=pat, tries=VN_TRIES[0], cs=False)
+    await state.set_state(Vanity.confirm)
+    await vn_show(m, state, edit=False)
+
+
+@router.callback_query(F.data.startswith("vn_t:"), StateFilter(Vanity.confirm))
+async def cb_vn_tries(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    t = int(c.data.split(":")[1])
+    if t in VN_TRIES:
+        await state.update_data(tries=t)
+        await vn_show(c.message, state, edit=True)
+
+
+@router.callback_query(F.data == "vn_cs", StateFilter(Vanity.confirm))
+async def cb_vn_cs(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    data = await state.get_data()
+    new_cs = not data["cs"]
+    if vanity_probability(data["mode"], data["pattern"], new_cs) == 0:
+        await c.answer("با این حالت امکان‌پذیر نیست.", show_alert=True)
+        return
+    await state.update_data(cs=new_cs)
+    await vn_show(c.message, state, edit=True)
+
+
+@router.callback_query(F.data == "vn_stop")
+async def cb_vn_stop(c: CallbackQuery):
+    cur = VN_PROGRESS.get("cur")
+    if cur:
+        cur["stop"] = True
+    await c.answer("در حال توقف…")
+
+
+@router.callback_query(F.data == "vn_go", StateFilter(Vanity.confirm))
+async def cb_vn_go(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    data = await state.get_data()
+    await state.clear()
+    if SEARCH_LOCK.locked():
+        await c.message.answer("⏳ یک جستجوی دیگر در حال انجام است. صبر کن تمام شود.")
+        return
+    mode, pat, tries, cs = data["mode"], data["pattern"], data["tries"], data["cs"]
+    progress = {"done": 0, "found": [], "stop": False}
+    VN_PROGRESS["cur"] = progress
+    stop_kb = InlineKeyboardMarkup(inline_keyboard=[[btn("⏹ توقف", "vn_stop")]])
+    status = await c.message.answer("⏳ شروع جستجو…", reply_markup=stop_kb)
+    async with SEARCH_LOCK:
+        task = asyncio.create_task(
+            asyncio.to_thread(vanity_search, mode, pat, cs, tries, progress)
+        )
+        last = ""
+        while True:
+            finished, _ = await asyncio.wait({task}, timeout=5)
+            text = (
+                f"🔎 جستجو… {progress['done']:,} / {tries:,}\n"
+                f"🎯 پیدا شده: {len(progress['found'])}"
+            )
+            if text != last and not finished:
+                last = text
+                try:
+                    await status.edit_text(text, reply_markup=stop_kb)
+                except TelegramBadRequest:
+                    pass
+            if finished:
+                break
+    VN_PROGRESS.pop("cur", None)
+    err = progress.get("error")
+    if err:
+        await status.edit_text(
+            f"❌ جستجو ناموفق بود:\n<code>{html.escape(err)[:1500]}</code>"
+        )
+        await c.message.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
+        return
+    found = progress["found"]
+    done = progress["done"]
+    if not found:
+        await status.edit_text(
+            f"😕 بعد از {done:,} تلاش، آدرسی با الگوی «{html.escape(pat)}» پیدا نشد.\n"
+            "الگو را کوتاه‌تر کن یا تعداد تلاش را بیشتر."
+        )
+        await c.message.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
+        return
+    save_wallets(found)
+    await status.edit_text(f"✅ بعد از {done:,} تلاش، {len(found)} آدرس خاص پیدا شد.")
+    await send_wallet_files(
+        c.message,
+        found,
+        f"🎯 {len(found)} آدرس خاص (آدرس + ۲۴ کلمه).\n"
+        "⚠️ فایل را جای امن ذخیره کن و بعدش پیام را از چت پاک کن.",
+    )
+    if len(found) <= 10:
+        body = "\n\n".join(
+            f"<b>#{i}</b>\n<code>{a}</code>\n<code>{w}</code>"
+            for i, (a, w) in enumerate(found, 1)
+        )
+        shown = await c.message.answer(body + "\n\n⚠️ این پیام بعد از ۲ دقیقه پاک می‌شود.")
+        asyncio.create_task(delete_later(shown, 120))
+    await c.message.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
 
 
 @router.message()
