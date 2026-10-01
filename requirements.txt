@@ -1,5 +1,2 @@
-aiogram>=3.7,<4
-tonsdk
-httpx
-tonutils
-cryptography
+python-telegram-bot==22.5
+tonutils==2.3.0
