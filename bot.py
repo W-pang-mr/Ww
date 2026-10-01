@@ -675,8 +675,8 @@ def generate_wallets(n: int):
 
 
 # ───────────── جستجوی آدرس خاص (Vanity) ─────────────
-VN_MAX_SECONDS = 1200
-VN_TRIES = (1000, 5000, 20000)
+# محدودیت زمانی برداشته شد؛ جستجو فقط با تمام شدن تعداد تلاش یا دکمه‌ی توقف تمام می‌شود.
+VN_TRIES = (1000, 5000, 20000, 100000)
 VN_PROGRESS: dict = {}
 SEARCH_LOCK = asyncio.Lock()
 
@@ -711,9 +711,8 @@ def vanity_probability(mode: str, pat: str, cs: bool) -> float:
 def vanity_search(mode: str, pat: str, cs: bool, tries: int, progress: dict) -> None:
     try:
         make, first = _get_creator()
-        start = time.time()
         for i in range(tries):
-            if progress["stop"] or time.time() - start > VN_MAX_SECONDS:
+            if progress["stop"]:
                 break
             item = first if i == 0 else make()
             progress["done"] = i + 1
@@ -995,7 +994,7 @@ def vn_view(data: dict):
         text += "\n⚠️ با این تعداد تلاش احتمالا چیزی پیدا نمی‌شود. الگو را کوتاه‌تر کن یا تعداد را بیشتر.\n"
     text += (
         "\nفقط ولت‌هایی که الگو را دارند ذخیره و ارسال می‌شوند، بقیه دور ریخته می‌شوند.\n"
-        "حداکثر زمان جستجو: ۲۰ دقیقه."
+        "هر وقت خواستی با دکمه‌ی «توقف» جستجو را متوقف کن."
     )
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
