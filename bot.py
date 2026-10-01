@@ -553,35 +553,114 @@ def _find_wallet_class():
     raise RuntimeError(f"WalletV5R1 not found (tonutils {ver})")
 
 
+def _network_value(testnet: bool):
+    try:
+        from tonutils.types import NetworkGlobalID
+
+        return NetworkGlobalID.TESTNET if testnet else NetworkGlobalID.MAINNET
+    except Exception:
+        return -3 if testnet else -239
+
+
+def _build_clients():
+    """کلاینت‌های tonutils را (بدون اتصال به شبکه) می‌سازد؛ فقط برای ساختن ولت لازم است."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    import tonutils
+
+    found = []
+    for info in pkgutil.walk_packages(tonutils.__path__, "tonutils."):
+        if "client" not in info.name.lower():
+            continue
+        try:
+            mod = importlib.import_module(info.name)
+        except Exception:
+            continue
+        for name, obj in vars(mod).items():
+            if (
+                inspect.isclass(obj)
+                and name.endswith("Client")
+                and getattr(obj, "__module__", "").startswith("tonutils")
+                and obj not in found
+                and not inspect.isabstract(obj)
+            ):
+                found.append(obj)
+    found.sort(key=lambda c: (0 if "Toncenter" in c.__name__ else 1, c.__name__))
+    clients, errors = [], []
+    for cls in found:
+        try:
+            sig = inspect.signature(cls.__init__)
+            kwargs = {}
+            for pname, prm in list(sig.parameters.items())[1:]:
+                if prm.kind in (prm.VAR_POSITIONAL, prm.VAR_KEYWORD):
+                    continue
+                needed = prm.default is inspect.Parameter.empty
+                if "network" in pname:
+                    if needed or IS_TEST:
+                        kwargs[pname] = _network_value(IS_TEST)
+                elif pname == "is_testnet":
+                    if needed or IS_TEST:
+                        kwargs[pname] = IS_TEST
+                elif needed:
+                    kwargs[pname] = None
+            clients.append(cls(**kwargs))
+        except Exception as e:
+            errors.append(f"{cls.__name__}: {e!r}"[:150])
+    return clients, errors, [c.__name__ for c in found]
+
+
+def _create_one(cls, client):
+    import inspect
+
+    res = cls.create(client)
+    if inspect.iscoroutine(res):
+        res = asyncio.run(res)
+    items = list(res) if isinstance(res, (tuple, list)) else [res]
+    wallet = next((x for x in items if hasattr(x, "address")), None)
+    mnemonic = next((x for x in items if isinstance(x, (list, str))), None)
+    if wallet is None or mnemonic is None:
+        raise RuntimeError(
+            "unexpected create() result: " + ", ".join(type(x).__name__ for x in items)
+        )
+    words = " ".join(mnemonic) if isinstance(mnemonic, list) else str(mnemonic)
+    words = " ".join(words.split())
+    if len(words.split()) != 24:
+        raise RuntimeError("mnemonic is not 24 words")
+    try:
+        addr = wallet.address.to_str(is_bounceable=False, is_test_only=IS_TEST)
+    except TypeError:
+        addr = wallet.address.to_str()
+    return addr, words
+
+
 def generate_wallets(n: int):
     """n ولت V5R1 با ۲۴ کلمه می‌سازد. خروجی: لیست (address, mnemonic)."""
     import inspect
 
     cls = _find_wallet_class()
-    result = []
-    for _ in range(n):
+    clients, errors, client_names = _build_clients()
+    first, working = None, None
+    for client in clients + [None]:
         try:
-            res = cls.create(None)
-        except (TypeError, AttributeError):
-            res = cls.create()
-        if inspect.iscoroutine(res):
-            res = asyncio.run(res)
-        items = list(res) if isinstance(res, (tuple, list)) else [res]
-        wallet = next((x for x in items if hasattr(x, "address")), None)
-        mnemonic = next((x for x in items if isinstance(x, (list, str))), None)
-        if wallet is None or mnemonic is None:
-            raise RuntimeError(
-                "unexpected create() result: " + ", ".join(type(x).__name__ for x in items)
-            )
-        words = " ".join(mnemonic) if isinstance(mnemonic, list) else str(mnemonic)
-        words = " ".join(words.split())
-        if len(words.split()) != 24:
-            raise RuntimeError("mnemonic is not 24 words")
+            first = _create_one(cls, client)
+            working = client
+            break
+        except Exception as e:
+            errors.append(f"create({type(client).__name__}): {e!r}"[:220])
+    if first is None:
         try:
-            addr = wallet.address.to_str(is_bounceable=False, is_test_only=IS_TEST)
-        except TypeError:
-            addr = wallet.address.to_str()
-        result.append((addr, words))
+            sig = str(inspect.signature(cls.create))
+        except Exception:
+            sig = "?"
+        raise RuntimeError(
+            f"create failed | sig={sig} | clients={','.join(client_names)} | "
+            + " || ".join(errors)
+        )
+    result = [first]
+    for _ in range(n - 1):
+        result.append(_create_one(cls, working))
     return result
 
 
@@ -668,7 +747,7 @@ async def st_gen_count(m: Message, state: FSMContext):
     except Exception as e:
         logging.exception("wallet generation failed")
         await status.edit_text(
-            f"❌ ساخت ناموفق بود:\n<code>{html.escape(repr(e))[:300]}</code>"
+            f"❌ ساخت ناموفق بود:\n<code>{html.escape(repr(e))[:1500]}</code>"
         )
         await m.answer("🏠 منوی اصلی", reply_markup=main_menu())
         return
