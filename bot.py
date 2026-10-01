@@ -516,16 +516,64 @@ def all_wallets():
     return [(r["address"], decrypt(r["mnemonic_enc"])) for r in rows]
 
 
+def _find_wallet_class():
+    """کلاس WalletV5R1 را در هر نسخه‌ی tonutils پیدا می‌کند."""
+    import importlib
+    import pkgutil
+
+    for name in (
+        "tonutils.wallet",
+        "tonutils.wallets",
+        "tonutils.contracts.wallet",
+        "tonutils.contracts",
+    ):
+        try:
+            mod = importlib.import_module(name)
+        except Exception:
+            continue
+        cls = getattr(mod, "WalletV5R1", None)
+        if cls is not None:
+            return cls
+    import tonutils
+
+    for info in pkgutil.walk_packages(tonutils.__path__, "tonutils."):
+        try:
+            mod = importlib.import_module(info.name)
+        except Exception:
+            continue
+        cls = getattr(mod, "WalletV5R1", None)
+        if cls is not None and hasattr(cls, "create"):
+            return cls
+    try:
+        from importlib.metadata import version
+
+        ver = version("tonutils")
+    except Exception:
+        ver = "?"
+    raise RuntimeError(f"WalletV5R1 not found (tonutils {ver})")
+
+
 def generate_wallets(n: int):
     """n ولت V5R1 با ۲۴ کلمه می‌سازد. خروجی: لیست (address, mnemonic)."""
-    from tonutils.client import ToncenterV3Client
-    from tonutils.wallet import WalletV5R1
+    import inspect
 
-    client = ToncenterV3Client(is_testnet=IS_TEST)
+    cls = _find_wallet_class()
     result = []
     for _ in range(n):
-        wallet, _pk, _sk, mnemonic = WalletV5R1.create(client)
-        words = " ".join(mnemonic) if isinstance(mnemonic, (list, tuple)) else str(mnemonic)
+        try:
+            res = cls.create(None)
+        except (TypeError, AttributeError):
+            res = cls.create()
+        if inspect.iscoroutine(res):
+            res = asyncio.run(res)
+        items = list(res) if isinstance(res, (tuple, list)) else [res]
+        wallet = next((x for x in items if hasattr(x, "address")), None)
+        mnemonic = next((x for x in items if isinstance(x, (list, str))), None)
+        if wallet is None or mnemonic is None:
+            raise RuntimeError(
+                "unexpected create() result: " + ", ".join(type(x).__name__ for x in items)
+            )
+        words = " ".join(mnemonic) if isinstance(mnemonic, list) else str(mnemonic)
         words = " ".join(words.split())
         if len(words.split()) != 24:
             raise RuntimeError("mnemonic is not 24 words")
