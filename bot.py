@@ -1,9 +1,12 @@
 import asyncio
+import base64
+import hashlib
 import html
 import io
 import logging
 import math
 import os
+import sqlite3
 import time
 from decimal import Decimal, InvalidOperation
 
@@ -16,12 +19,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 from aiohttp import web
+from cryptography.fernet import Fernet
 from tonsdk.boc import Cell
 from tonsdk.contract import Contract
 from tonsdk.contract.wallet import Wallets, WalletVersionEnum
@@ -84,8 +89,8 @@ async def call(method: str, params: dict | None = None, body: dict | None = None
     raise RuntimeError("Toncenter rate limit")
 
 
-async def get_balance() -> Decimal:
-    nano = await call("getAddressBalance", {"address": ADDRESS})
+async def get_balance(addr: str | None = None) -> Decimal:
+    nano = await call("getAddressBalance", {"address": addr or ADDRESS})
     return Decimal(int(nano)) / NANO
 
 
@@ -186,6 +191,10 @@ class Multi(StatesGroup):
     confirm = State()
 
 
+class GenWallets(StatesGroup):
+    count = State()
+
+
 def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
@@ -195,7 +204,7 @@ def main_menu() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [btn("💰 موجودی", "balance"), btn("📍 آدرس", "address")],
             [btn("📤 ارسال (تکی / گروهی)", "multi")],
-            [btn("📜 تاریخچه", "history")],
+            [btn("📜 تاریخچه", "history"), btn("🪪 ولت‌های V5", "wl_menu")],
         ]
     )
 
@@ -427,6 +436,342 @@ async def cb_confirm(c: CallbackQuery, state: FSMContext):
     await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
 
 
+# ───────────── ولت‌های V5R1 (ساخت، ذخیره، حذف) ─────────────
+MAX_GEN = 500
+PAGE_SIZE = 10
+DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+DB_PATH = os.getenv("DB_PATH", "wallets.db")
+PERSISTENT = os.path.isabs(DB_PATH)  # مثلا /data/wallets.db روی دیسک ماندگار
+FERNET = Fernet(
+    base64.urlsafe_b64encode(hashlib.sha256(("walletbot:" + MNEMONIC).encode()).digest())
+)
+
+
+def encrypt(text: str) -> str:
+    return FERNET.encrypt(text.encode()).decode()
+
+
+def decrypt(token: str) -> str:
+    try:
+        return FERNET.decrypt(token.encode()).decode()
+    except Exception:
+        return "❌ رمزگشایی ناموفق (MNEMONIC عوض شده؟)"
+
+
+def db_exec(sql: str, args=(), fetch: bool = False):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(sql, args)
+        rows = cur.fetchall() if fetch else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    db_exec(
+        """CREATE TABLE IF NOT EXISTS wallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT UNIQUE NOT NULL,
+            mnemonic_enc TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )"""
+    )
+
+
+def save_wallets(items) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        now = int(time.time())
+        conn.executemany(
+            "INSERT OR IGNORE INTO wallets (address, mnemonic_enc, created_at) VALUES (?,?,?)",
+            [(a, encrypt(w), now) for a, w in items],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_wallets() -> int:
+    return db_exec("SELECT COUNT(*) AS c FROM wallets", fetch=True)[0]["c"]
+
+
+def list_wallets(page: int):
+    return db_exec(
+        "SELECT id, address FROM wallets ORDER BY id LIMIT ? OFFSET ?",
+        (PAGE_SIZE, page * PAGE_SIZE),
+        True,
+    )
+
+
+def get_wallet(wid: int):
+    rows = db_exec("SELECT * FROM wallets WHERE id=?", (wid,), True)
+    return rows[0] if rows else None
+
+
+def all_wallets():
+    rows = db_exec("SELECT address, mnemonic_enc FROM wallets ORDER BY id", fetch=True)
+    return [(r["address"], decrypt(r["mnemonic_enc"])) for r in rows]
+
+
+def generate_wallets(n: int):
+    """n ولت V5R1 با ۲۴ کلمه می‌سازد. خروجی: لیست (address, mnemonic)."""
+    from tonutils.client import ToncenterV3Client
+    from tonutils.wallet import WalletV5R1
+
+    client = ToncenterV3Client(is_testnet=IS_TEST)
+    result = []
+    for _ in range(n):
+        wallet, _pk, _sk, mnemonic = WalletV5R1.create(client)
+        words = " ".join(mnemonic) if isinstance(mnemonic, (list, tuple)) else str(mnemonic)
+        words = " ".join(words.split())
+        if len(words.split()) != 24:
+            raise RuntimeError("mnemonic is not 24 words")
+        try:
+            addr = wallet.address.to_str(is_bounceable=False, is_test_only=IS_TEST)
+        except TypeError:
+            addr = wallet.address.to_str()
+        result.append((addr, words))
+    return result
+
+
+async def delete_later(msg: Message, seconds: int) -> None:
+    await asyncio.sleep(seconds)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def send_wallet_files(m: Message, wallets: list, caption: str) -> None:
+    txt = "\n".join(
+        f"#{i}\nAddress: {a}\nMnemonic: {w}\n" for i, (a, w) in enumerate(wallets, 1)
+    )
+    csv = "index,address,mnemonic\n" + "\n".join(
+        f"{i},{a},{w}" for i, (a, w) in enumerate(wallets, 1)
+    )
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    await m.answer_document(
+        BufferedInputFile(txt.encode("utf-8"), filename=f"wallets-{stamp}.txt"),
+        caption=caption,
+    )
+    await m.answer_document(
+        BufferedInputFile(csv.encode("utf-8"), filename=f"wallets-{stamp}.csv"),
+        caption="همان لیست به فرمت CSV",
+    )
+
+
+def wl_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("➕ ساخت ولت جدید", "gen")],
+            [btn("📋 لیست ولت‌ها", "wl_list:0"), btn("📥 دریافت همه (فایل)", "wl_export")],
+            [btn("🗑 حذف همه", "wl_delall")],
+            [btn("🏠 منوی اصلی", "home")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "home")
+async def cb_home(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    await c.message.answer("🏠 منوی اصلی", reply_markup=main_menu())
+
+
+@router.callback_query(F.data == "wl_menu")
+async def cb_wl_menu(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    text = f"🪪 <b>ولت‌های V5R1</b>\nتعداد ذخیره‌شده: <b>{count_wallets()}</b>"
+    if not PERSISTENT:
+        text += (
+            "\n\n⚠️ دیتابیس روی دیسک موقتی است و با ریستارت یا دیپلوی پاک می‌شود. "
+            "فایل‌هایی که موقع ساخت می‌گیری را حتما نگه دار."
+        )
+    await c.message.answer(text, reply_markup=wl_menu_kb())
+
+
+@router.callback_query(F.data == "gen")
+async def cb_gen(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(GenWallets.count)
+    await c.message.answer(
+        f"🪪 چند ولت V5R1 بسازم؟\nیک عدد بفرست (۱ تا {MAX_GEN}):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(StateFilter(GenWallets.count), F.text)
+async def st_gen_count(m: Message, state: FSMContext):
+    try:
+        n = int(m.text.strip().translate(DIGITS))
+    except ValueError:
+        n = 0
+    if not 1 <= n <= MAX_GEN:
+        await m.answer(f"❌ یک عدد بین ۱ تا {MAX_GEN} بفرست:", reply_markup=cancel_kb())
+        return
+    await state.clear()
+    status = await m.answer(f"⏳ در حال ساخت {n} ولت… (ممکنه چند دقیقه طول بکشه)")
+    try:
+        wallets = await asyncio.to_thread(generate_wallets, n)
+    except Exception as e:
+        logging.exception("wallet generation failed")
+        await status.edit_text(
+            f"❌ ساخت ناموفق بود:\n<code>{html.escape(repr(e))[:300]}</code>"
+        )
+        await m.answer("🏠 منوی اصلی", reply_markup=main_menu())
+        return
+    save_wallets(wallets)
+    await send_wallet_files(
+        m,
+        wallets,
+        f"✅ {n} ولت V5R1 ساخته شد (آدرس + ۲۴ کلمه).\n"
+        "⚠️ فایل رو همین الان جای امن ذخیره کن و بعدش پیام رو از چت پاک کن.",
+    )
+    if n <= 10:
+        body = "\n\n".join(
+            f"<b>#{i}</b>\n<code>{a}</code>\n<code>{w}</code>"
+            for i, (a, w) in enumerate(wallets, 1)
+        )
+        shown = await m.answer(body + "\n\n⚠️ این پیام بعد از ۲ دقیقه پاک میشه.")
+        asyncio.create_task(delete_later(shown, 120))
+    await status.delete()
+    await m.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
+
+
+@router.callback_query(F.data.startswith("wl_list:"))
+async def cb_wl_list(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    total = count_wallets()
+    if total == 0:
+        await c.message.answer("هنوز ولتی ذخیره نشده.", reply_markup=wl_menu_kb())
+        return
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    page = min(max(int(c.data.split(":")[1]), 0), pages - 1)
+    rows = [
+        [btn(f"#{r['id']}  {short(r['address'])}", f"wl_view:{r['id']}")]
+        for r in list_wallets(page)
+    ]
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️ قبلی", f"wl_list:{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn("بعدی ▶️", f"wl_list:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([btn("⬅️ برگشت", "wl_menu")])
+    await c.message.answer(
+        f"📋 ولت‌ها ({total}) — صفحه {page + 1}/{pages}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("wl_view:"))
+async def cb_wl_view(c: CallbackQuery):
+    await c.answer()
+    wid = int(c.data.split(":")[1])
+    row = get_wallet(wid)
+    if not row:
+        await c.message.answer("❌ این ولت پیدا نشد.", reply_markup=wl_menu_kb())
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("🗑 حذف این ولت", f"wl_del:{wid}")],
+            [btn("📋 لیست", "wl_list:0")],
+        ]
+    )
+    sent = await c.message.answer(
+        f"🪪 <b>ولت #{wid}</b>\n\n"
+        f"📍 آدرس:\n<code>{row['address']}</code>\n\n"
+        f"🔐 ۲۴ کلمه:\n<code>{decrypt(row['mnemonic_enc'])}</code>\n\n"
+        "⚠️ این پیام بعد از ۶۰ ثانیه پاک میشه.",
+        reply_markup=kb,
+    )
+    asyncio.create_task(delete_later(sent, 60))
+
+
+@router.callback_query(F.data.startswith("wl_del:"))
+async def cb_wl_del(c: CallbackQuery):
+    await c.answer()
+    wid = int(c.data.split(":")[1])
+    row = get_wallet(wid)
+    if not row:
+        await c.message.answer("❌ این ولت پیدا نشد.", reply_markup=wl_menu_kb())
+        return
+    try:
+        bal = await get_balance(row["address"])
+        bal_text = f"💰 موجودی این ولت: <b>{bal:.4f} TON</b>"
+        if bal > 0:
+            bal_text += "\n🚨 این ولت پول دارد!"
+    except Exception:
+        bal_text = "💰 موجودی: نامشخص (خطای شبکه)"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("✅ بله، حذف کن", f"wl_delyes:{wid}"), btn("❌ انصراف", "wl_list:0")]
+        ]
+    )
+    await c.message.answer(
+        f"🗑 حذف ولت #{wid}\n<code>{short(row['address'])}</code>\n\n{bal_text}\n\n"
+        "با حذف، ۲۴ کلمه از ربات پاک می‌شود و برگشتی ندارد. "
+        "اگر کلمات را جای دیگری نداری، ممکنه پولت برای همیشه از دست بره.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("wl_delyes:"))
+async def cb_wl_delyes(c: CallbackQuery):
+    await c.answer()
+    wid = int(c.data.split(":")[1])
+    db_exec("DELETE FROM wallets WHERE id=?", (wid,))
+    await c.message.answer(f"✅ ولت #{wid} حذف شد.", reply_markup=wl_menu_kb())
+
+
+@router.callback_query(F.data == "wl_export")
+async def cb_wl_export(c: CallbackQuery):
+    await c.answer()
+    wallets = all_wallets()
+    if not wallets:
+        await c.message.answer("هنوز ولتی ذخیره نشده.", reply_markup=wl_menu_kb())
+        return
+    await send_wallet_files(
+        c.message,
+        wallets,
+        f"📥 همه {len(wallets)} ولت ذخیره‌شده.\n⚠️ جای امن ذخیره کن و پیام رو پاک کن.",
+    )
+    await c.message.answer("🪪 ولت‌ها", reply_markup=wl_menu_kb())
+
+
+@router.callback_query(F.data == "wl_delall")
+async def cb_wl_delall(c: CallbackQuery):
+    await c.answer()
+    total = count_wallets()
+    if total == 0:
+        await c.message.answer("هنوز ولتی ذخیره نشده.", reply_markup=wl_menu_kb())
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [btn("📥 اول فایل بگیر", "wl_export")],
+            [btn(f"🗑 حذف همه {total} ولت", "wl_delallyes"), btn("❌ انصراف", "wl_menu")],
+        ]
+    )
+    await c.message.answer(
+        f"🚨 حذف <b>همه {total}</b> ولت؟\n"
+        "کلمات از ربات پاک می‌شوند و برگشتی ندارد. اگر ولتی پول دارد و فایل نداری، اول فایل بگیر.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "wl_delallyes")
+async def cb_wl_delallyes(c: CallbackQuery):
+    await c.answer()
+    db_exec("DELETE FROM wallets")
+    await c.message.answer("✅ همه ولت‌ها حذف شدند.", reply_markup=wl_menu_kb())
+
+
 @router.message()
 async def fallback(m: Message, state: FSMContext):
     if await state.get_state() is None:
@@ -450,6 +795,7 @@ async def start_web():
 
 
 async def main():
+    init_db()
     await start_web()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
